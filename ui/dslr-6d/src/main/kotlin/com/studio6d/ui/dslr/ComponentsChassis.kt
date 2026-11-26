@@ -271,6 +271,7 @@ fun DigitalMangoPrismHeader(
     zoomRatio: Float,
     apertureF: Float,
     isAeLocked: Boolean,
+    baseFocal35mm: Float = 24f,
     modifier: Modifier = Modifier
 ) {
     Row(
@@ -312,7 +313,7 @@ fun DigitalMangoPrismHeader(
                 }
             }
             Text(
-                text = "${DslrStops.formatFocalLength35mm(zoomRatio)} · ${DslrStops.formatAperture(apertureF)}",
+                text = "${DslrStops.formatFocalLength35mm(zoomRatio, baseFocal35mm)} · ${DslrStops.formatAperture(apertureF)}",
                 fontSize = 8.sp,
                 fontFamily = FontFamily.Monospace,
                 fontWeight = FontWeight.Bold,

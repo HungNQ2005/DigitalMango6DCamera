@@ -1324,7 +1324,9 @@ class Camera2DslrController(
                     focusNormY = settings.customFocusNormY,
                     lensDiopters = meta.diopters,
                     isFocusLocked = meta.wasFocused,
-                    isAutoMultiPointAf = settings.isAutoAfSelection
+                    isAutoMultiPointAf = settings.isAutoAfSelection,
+                    apertureF = settings.simulatedApertureF,
+                    dofWidthScale = settings.externalLens.dofWidthScale
                 )
             } else {
                 com.studio6d.core.lut.SubjectMaskData.NONE
@@ -1461,7 +1463,7 @@ class Camera2DslrController(
                 val biasScale = if (evBiasOverride != null) 2.0.pow(-evBiasOverride.toDouble()) else 1.0
                 val expSeconds = (settings.shutterSpeedNs * biasScale) / 1_000_000_000.0
                 val effectiveIso = if (settings.iso <= 0) settings.liveMeteredIso else settings.iso
-                val focal35mm = (24f * settings.zoomRatio).roundToInt()
+                val focal35mm = (settings.externalLens.baseFocal35mm * settings.zoomRatio).roundToInt()
                 val captureDate = Date(captureTimestampMs)
                 val exifDate = SimpleDateFormat("yyyy:MM:dd HH:mm:ss", Locale.US).format(captureDate)
                 val subSec = SimpleDateFormat("SSS", Locale.US).format(captureDate)

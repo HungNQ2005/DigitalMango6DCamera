@@ -61,6 +61,7 @@ import com.studio6d.core.model.AfMode
 import com.studio6d.core.model.CameraSettingsState
 import com.studio6d.core.model.DriveMode
 import com.studio6d.core.model.DslrStops
+import com.studio6d.core.model.ExternalLensProfile
 import com.studio6d.core.model.FlashMode
 import com.studio6d.core.model.GridMode
 import com.studio6d.core.model.MeteringMode
@@ -468,6 +469,15 @@ fun CameraMenuOverlay(
                         label = "Optical Lens Bokeh (${DslrStops.formatAperture(state.simulatedApertureF)})",
                         checked = state.opticalBokehEnabled,
                         onToggle = { onUpdateState { it.copy(opticalBokehEnabled = !it.opticalBokehEnabled) } }
+                    )
+                    MenuCycleRow(
+                        label = "External Lens Attachment",
+                        value = state.externalLens.label,
+                        onClick = {
+                            val entries = ExternalLensProfile.entries
+                            val next = entries[(state.externalLens.ordinal + 1) % entries.size]
+                            onUpdateState { it.copy(externalLens = next) }
+                        }
                     )
                     MenuToggleRow(
                         label = "11-Point Auto AF Selection",

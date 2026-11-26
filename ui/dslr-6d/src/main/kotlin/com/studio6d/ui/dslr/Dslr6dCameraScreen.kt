@@ -227,6 +227,7 @@ fun Dslr6dCameraScreen(
                     zoomRatio = state.zoomRatio,
                     apertureF = state.simulatedApertureF,
                     isAeLocked = state.isAeLocked,
+                    baseFocal35mm = state.externalLens.baseFocal35mm,
                     modifier = Modifier.fillMaxWidth()
                 )
 

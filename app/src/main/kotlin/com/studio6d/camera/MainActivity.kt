@@ -140,13 +140,16 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         }
     }
 
+    private var gripShutterDownMs: Long = 0L
+
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
         return when (keyCode) {
             KeyEvent.KEYCODE_VOLUME_UP,
             KeyEvent.KEYCODE_VOLUME_DOWN,
             KeyEvent.KEYCODE_CAMERA -> {
                 if (event?.repeatCount == 0) {
-                    viewModel.onShutterFire()
+                    gripShutterDownMs = System.currentTimeMillis()
+                    viewModel.onHalfPressAf()
                 }
                 true
             }
@@ -161,11 +164,21 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     }
 
     override fun onKeyUp(keyCode: Int, event: KeyEvent?): Boolean {
-        if (keyCode == KeyEvent.KEYCODE_FOCUS) {
-            viewModel.onReleaseHalfPress()
-            return true
+        return when (keyCode) {
+            KeyEvent.KEYCODE_VOLUME_UP,
+            KeyEvent.KEYCODE_VOLUME_DOWN,
+            KeyEvent.KEYCODE_CAMERA -> {
+                val heldMs = System.currentTimeMillis() - gripShutterDownMs
+                viewModel.onShutterFire(fromHalfPress = heldMs >= 350L)
+                viewModel.onReleaseHalfPress()
+                true
+            }
+            KeyEvent.KEYCODE_FOCUS -> {
+                viewModel.onReleaseHalfPress()
+                true
+            }
+            else -> super.onKeyUp(keyCode, event)
         }
-        return super.onKeyUp(keyCode, event)
     }
 
     override fun onSensorChanged(event: SensorEvent?) {

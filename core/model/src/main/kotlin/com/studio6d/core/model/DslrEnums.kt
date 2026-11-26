@@ -80,3 +80,17 @@ enum class InfoDisplayMode {
 
     fun next(): InfoDisplayMode = entries[(ordinal + 1) % entries.size]
 }
+
+enum class ExternalLensProfile(
+    val badge: String,
+    val label: String,
+    val baseFocal35mm: Float,
+    val bokehAssistScale: Float,
+    val dofWidthScale: Float
+) {
+    STOCK_24MM("24mm", "Built-in 24mm Wide", 24f, 1.00f, 1.00f),
+    PORTRAIT_50MM("50mm", "External 50mm / 2x Tele", 50f, 0.85f, 0.92f),
+    TELE_75MM("75mm", "External 75-85mm Tele", 75f, 0.72f, 0.86f),
+    MACRO("MACRO", "External Macro Lens", 100f, 0.45f, 1.15f),
+    ANAMORPHIC("ANAM", "External Anamorphic", 32f, 0.95f, 0.96f)
+}

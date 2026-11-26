@@ -28,6 +28,9 @@ import kotlin.math.sqrt
  */
 class OpticalSubjectSegmenter private constructor(@Suppress("UNUSED_PARAMETER") context: Context) {
 
+    private val depthEstimator = OnnxDepthEstimator.getInstance(context.applicationContext).also {
+        it.warmUpAsync()
+    }
     private val liveSelfieInFlight = AtomicBoolean(false)
     private val stillSelfieInFlight = AtomicBoolean(false)
     private var livePixels = IntArray(0)
@@ -121,16 +124,128 @@ class OpticalSubjectSegmenter private constructor(@Suppress("UNUSED_PARAMETER") 
         focusNormX: Float,
         focusNormY: Float,
         lensDiopters: Float,
-        isAutoMultiPointAf: Boolean = true
+        isAutoMultiPointAf: Boolean = true,
+        apertureF: Float = 2.0f,
+        dofWidthScale: Float = 1.0f
     ): SubjectMaskData {
         // NOTE: Never call thumb.recycle() manually; ML Kit's async native workers may outlive coroutine timeouts.
-        val thumb = createUprightThreeTwoThumb(sourceBitmap, exifDegrees, STILL_MASK_W, STILL_MASK_H)
+        val guideW = 600
+        val guideH = 400
+        val thumb = createUprightThreeTwoThumb(sourceBitmap, exifDegrees, guideW, guideH)
         val w = thumb.width
         val h = thumb.height
-        val rgbaBuf = ByteBuffer.allocate(w * h * 4)
+        val total = w * h
+        val rgbaBuf = ByteBuffer.allocate(total * 4)
         thumb.copyPixelsToBuffer(rgbaBuf)
         val uprightRgba = rgbaBuf.array()
 
+        // Tier 1 (Primary): Offline Depth Anything V2 Small + 3-Channel Fast Guided Filter
+        val depthResult = depthEstimator.estimateNormalizedDisparity(thumb)
+        if (depthResult != null) {
+            val (lowDisp, dims) = depthResult
+            val upsampled = resampleBilinear(lowDisp, dims.first, dims.second, w, h)
+            val guidedDepth = FastGuidedFilter.filter(
+                guideRgba = uprightRgba,
+                src = upsampled,
+                width = w,
+                height = h,
+                radius = 8,
+                eps = 0.0045f
+            )
+
+            val fx = (focusNormX.coerceIn(0.02f, 0.98f) * w).roundToInt().coerceIn(0, w - 1)
+            val fy = (focusNormY.coerceIn(0.02f, 0.98f) * h).roundToInt().coerceIn(0, h - 1)
+            val radX = (w * 0.040f).roundToInt().coerceAtLeast(4)
+            val radY = (h * 0.040f).roundToInt().coerceAtLeast(4)
+            val y0 = (fy - radY).coerceAtLeast(0)
+            val y1 = (fy + radY).coerceAtMost(h - 1)
+            val x0 = (fx - radX).coerceAtLeast(0)
+            val x1 = (fx + radX).coerceAtMost(w - 1)
+            val windowSamples = FloatArray((y1 - y0 + 1) * (x1 - x0 + 1))
+            var sCount = 0
+            for (yy in y0..y1) {
+                val row = yy * w
+                for (xx in x0..x1) {
+                    windowSamples[sCount++] = guidedDepth[row + xx]
+                }
+            }
+            windowSamples.sort(0, sCount)
+            val focusDepth = if (sCount > 0) {
+                windowSamples[(sCount * 0.56f).roundToInt().coerceIn(0, sCount - 1)]
+            } else {
+                guidedDepth[fy * w + fx]
+            }
+
+            // Optional human-portrait enhancement: stabilize portrait foreground plane while preserving 3D DoF
+            val selfieAlphas = withTimeoutOrNull(250L) {
+                runSelfieSegmentation(thumb, focusNormX, focusNormY, isAutoMultiPointAf, isLiveStream = false)
+            }
+            if (selfieAlphas != null && selfieAlphas.size >= total) {
+                for (i in 0 until total) {
+                    val sa = selfieAlphas[i]
+                    if (sa > 0.72f) {
+                        guidedDepth[i] = (guidedDepth[i] * 0.60f + focusDepth * 0.40f).coerceIn(0f, 1f)
+                    }
+                }
+            }
+
+            val baseHalfWidth = when {
+                apertureF <= 1.25f -> 0.095f
+                apertureF <= 1.50f -> 0.105f
+                apertureF <= 2.10f -> 0.128f
+                apertureF <= 2.90f -> 0.158f
+                apertureF <= 4.10f -> 0.205f
+                apertureF <= 5.70f -> 0.260f
+                else -> 0.320f
+            }
+            val dofHalfWidth = (baseHalfWidth * dofWidthScale).coerceIn(0.07f, 0.38f)
+            val dofFalloff = 0.29f
+
+            var minD = 1f
+            var maxD = 0f
+            var inFocusCount = 0
+            var separatedCount = 0
+            for (i in 0 until total) {
+                val d = guidedDepth[i]
+                if (d < minD) minD = d
+                if (d > maxD) maxD = d
+                val diff = abs(d - focusDepth)
+                if (diff <= dofHalfWidth * 1.05f) inFocusCount++
+                if (diff > dofHalfWidth * 1.15f) separatedCount++
+            }
+
+            if (inFocusCount < (total * 0.015f).toInt() ||
+                separatedCount < (total * 0.04f).toInt() ||
+                (maxD - minD) <= dofHalfWidth * 1.30f
+            ) {
+                return SubjectMaskData.NONE
+            }
+
+            val depthBytes = ByteArray(total)
+            val maskBytes = ByteArray(total)
+            for (i in 0 until total) {
+                val d = guidedDepth[i].coerceIn(0f, 1f)
+                depthBytes[i] = (d * 255f + 0.5f).toInt().coerceIn(0, 255).toByte()
+                val diff = abs(d - focusDepth)
+                val t = ((diff - dofHalfWidth) / dofFalloff).coerceIn(0f, 1f)
+                val smooth = t * t * (3f - 2f * t)
+                val sharp = (1f - smooth).coerceIn(0f, 1f)
+                maskBytes[i] = (sharp * 255f + 0.5f).toInt().coerceIn(0, 255).toByte()
+            }
+
+            return SubjectMaskData(
+                maskBytes = maskBytes,
+                width = w,
+                height = h,
+                hasSubject = true,
+                depthBytes = depthBytes,
+                focusDepth = focusDepth,
+                dofHalfWidth = dofHalfWidth,
+                dofFalloff = dofFalloff
+            )
+        }
+
+        // Tier 2 Fallback: Bundled Selfie Segmentation -> Edge-Guided Dual-Geodesic Segmenter
         val selfieAlphas = withTimeoutOrNull(450L) {
             runSelfieSegmentation(thumb, focusNormX, focusNormY, isAutoMultiPointAf, isLiveStream = false)
         }

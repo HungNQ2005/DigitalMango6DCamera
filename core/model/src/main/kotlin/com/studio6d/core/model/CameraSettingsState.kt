@@ -31,6 +31,7 @@ data class CameraSettingsState(
     val zoomRatio: Float = 1.0f,
     val minZoomRatio: Float = 1.0f,
     val maxZoomRatio: Float = 8.0f,
+    val externalLens: ExternalLensProfile = ExternalLensProfile.STOCK_24MM,
     val isAeLocked: Boolean = false,
     val flashMode: FlashMode = FlashMode.OFF,
     val aebEnabled: Boolean = false,
@@ -89,7 +90,7 @@ data class CameraSettingsState(
     val opticalBokehStrength: Float
         get() {
             if (!opticalBokehEnabled || simulatedApertureF >= 8.0f) return 0f
-            return when {
+            val base = when {
                 simulatedApertureF <= 1.25f -> 0.80f
                 simulatedApertureF <= 1.5f -> 0.68f
                 simulatedApertureF <= 2.1f -> 0.52f
@@ -98,6 +99,7 @@ data class CameraSettingsState(
                 simulatedApertureF <= 5.7f -> 0.09f
                 else -> 0f
             }
+            return (base * externalLens.bokehAssistScale).coerceIn(0f, 0.85f)
         }
 
     /**

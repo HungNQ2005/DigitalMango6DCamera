@@ -140,7 +140,8 @@ object DslrStops {
             ?: clamped
     }
 
-    fun formatFocalLength35mm(zoomRatio: Float): String = "${(24f * zoomRatio).roundToInt()}mm"
+    fun formatFocalLength35mm(zoomRatio: Float, baseFocal35mm: Float = 24f): String =
+        "${(baseFocal35mm * zoomRatio).roundToInt()}mm"
 
     fun formatZoom(zoomRatio: Float): String =
         if (zoomRatio >= 9.95f) "${zoomRatio.roundToInt()}x" else "%.1fx".format(zoomRatio)

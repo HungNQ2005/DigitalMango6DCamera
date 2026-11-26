@@ -49,6 +49,7 @@ object GpuStillLutProcessor {
     private var uvVboId = 0
     private var srcTexId = 0
     private var maskTexId = 0
+    private var depthTexId = 0
 
     private var bgFboA = 0
     private var bgTexA = 0
@@ -241,14 +242,15 @@ object GpuStillLutProcessor {
         GLES30.glBufferData(GLES30.GL_ARRAY_BUFFER, QUAD_UV.size * 4, uvBuf, GLES30.GL_STATIC_DRAW)
         GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, 0)
 
-        val texs = IntArray(6)
-        GLES30.glGenTextures(6, texs, 0)
+        val texs = IntArray(7)
+        GLES30.glGenTextures(7, texs, 0)
         srcTexId = texs[0]
         bgTexA = texs[1]
         bgTexB = texs[2]
         bgTexDeep = texs[3]
         fboTexId = texs[4]
         maskTexId = texs[5]
+        depthTexId = texs[6]
 
         for (id in listOf(srcTexId, bgTexA, bgTexB, bgTexDeep, fboTexId)) {
             GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, id)
@@ -258,17 +260,20 @@ object GpuStillLutProcessor {
             GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_T, GLES30.GL_CLAMP_TO_EDGE)
         }
 
-        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, maskTexId)
-        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MIN_FILTER, GLES30.GL_LINEAR)
-        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MAG_FILTER, GLES30.GL_LINEAR)
-        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_S, GLES30.GL_CLAMP_TO_EDGE)
-        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_T, GLES30.GL_CLAMP_TO_EDGE)
         val initMask = ByteBuffer.allocateDirect(4).apply {
             repeat(4) { put(0xFF.toByte()) }
             position(0)
         }
         GLES30.glPixelStorei(GLES30.GL_UNPACK_ALIGNMENT, 1)
-        GLES30.glTexImage2D(GLES30.GL_TEXTURE_2D, 0, GLES30.GL_R8, 2, 2, 0, GLES30.GL_RED, GLES30.GL_UNSIGNED_BYTE, initMask)
+        for (id in listOf(maskTexId, depthTexId)) {
+            initMask.position(0)
+            GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, id)
+            GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MIN_FILTER, GLES30.GL_LINEAR)
+            GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MAG_FILTER, GLES30.GL_LINEAR)
+            GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_S, GLES30.GL_CLAMP_TO_EDGE)
+            GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_T, GLES30.GL_CLAMP_TO_EDGE)
+            GLES30.glTexImage2D(GLES30.GL_TEXTURE_2D, 0, GLES30.GL_R8, 2, 2, 0, GLES30.GL_RED, GLES30.GL_UNSIGNED_BYTE, initMask)
+        }
 
         val fbos = IntArray(4)
         GLES30.glGenFramebuffers(4, fbos, 0)
@@ -374,6 +379,10 @@ object GpuStillLutProcessor {
             subjectMask.width > 0 &&
             subjectMask.height > 0 &&
             subjectMask.maskBytes.size >= subjectMask.width * subjectMask.height
+        val depthBytes = subjectMask.depthBytes
+        val hasValidDepth = hasValidMask &&
+            depthBytes != null &&
+            depthBytes.size >= subjectMask.width * subjectMask.height
 
         val distanceBoost = (0.80f + 0.45f * (lensDiopters.coerceIn(0.35f, 3.2f) / 2.0f)).coerceIn(0.80f, 1.55f)
         val effectiveBokeh = if (hasValidMask) (bokehStrength * distanceBoost).coerceIn(0f, 1.15f) else 0f
@@ -390,6 +399,18 @@ object GpuStillLutProcessor {
                 subjectMask.width, subjectMask.height, 0,
                 GLES30.GL_RED, GLES30.GL_UNSIGNED_BYTE, maskBuf
             )
+            if (hasValidDepth && depthBytes != null) {
+                val depthBuf = ByteBuffer.allocateDirect(depthBytes.size)
+                    .order(ByteOrder.nativeOrder())
+                    .put(depthBytes)
+                    .apply { position(0) }
+                GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, depthTexId)
+                GLES30.glTexImage2D(
+                    GLES30.GL_TEXTURE_2D, 0, GLES30.GL_R8,
+                    subjectMask.width, subjectMask.height, 0,
+                    GLES30.GL_RED, GLES30.GL_UNSIGNED_BYTE, depthBuf
+                )
+            }
 
             // PASS 1A & 1B: 17x17 Foreground-Excluded Separable Gaussian Background at 1/4 Res
             val reqHalfW = (outW / 4).coerceAtLeast(240)
@@ -412,11 +433,17 @@ object GpuStillLutProcessor {
             GLES30.glActiveTexture(GLES30.GL_TEXTURE2)
             GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, maskTexId)
             GLES30.glUniform1i(GLES30.glGetUniformLocation(sepProgramId, "uSubjectMaskTex"), 2)
+            GLES30.glActiveTexture(GLES30.GL_TEXTURE5)
+            GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, depthTexId)
+            GLES30.glUniform1i(GLES30.glGetUniformLocation(sepProgramId, "uDepthTex"), 5)
             GLES30.glUniform1i(GLES30.glGetUniformLocation(sepProgramId, "uRotationMode"), rotMode)
             GLES30.glUniform2f(GLES30.glGetUniformLocation(sepProgramId, "uCropScale"), cropScaleX, cropScaleY)
             GLES30.glUniform2f(GLES30.glGetUniformLocation(sepProgramId, "uBlurStep"), stepX, 0f)
             GLES30.glUniform1i(GLES30.glGetUniformLocation(sepProgramId, "uIsSrcPass"), 1)
             GLES30.glUniform1f(GLES30.glGetUniformLocation(sepProgramId, "uHasSubject"), 1f)
+            GLES30.glUniform1f(GLES30.glGetUniformLocation(sepProgramId, "uHasDepth"), if (hasValidDepth) 1f else 0f)
+            GLES30.glUniform1f(GLES30.glGetUniformLocation(sepProgramId, "uFocusDepth"), subjectMask.focusDepth)
+            GLES30.glUniform1f(GLES30.glGetUniformLocation(sepProgramId, "uDofHalfWidth"), subjectMask.dofHalfWidth)
             drawBoundQuad()
 
             // Pass 1B: Vertical blur from bgTexA -> bgFboB
@@ -445,9 +472,13 @@ object GpuStillLutProcessor {
             GLES30.glActiveTexture(GLES30.GL_TEXTURE2)
             GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, maskTexId)
             GLES30.glUniform1i(GLES30.glGetUniformLocation(discProgramId, "uSubjectMaskTex"), 2)
-            GLES30.glUniform1i(GLES30.glGetUniformLocation(discProgramId, "uRotationMode"), rotMode)
-            GLES30.glUniform2f(GLES30.glGetUniformLocation(discProgramId, "uCropScale"), cropScaleX, cropScaleY)
+            GLES30.glActiveTexture(GLES30.GL_TEXTURE5)
+            GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, depthTexId)
+            GLES30.glUniform1i(GLES30.glGetUniformLocation(discProgramId, "uDepthTex"), 5)
             GLES30.glUniform1f(GLES30.glGetUniformLocation(discProgramId, "uBokehStrength"), effectiveBokeh)
+            GLES30.glUniform1f(GLES30.glGetUniformLocation(discProgramId, "uHasDepth"), if (hasValidDepth) 1f else 0f)
+            GLES30.glUniform1f(GLES30.glGetUniformLocation(discProgramId, "uFocusDepth"), subjectMask.focusDepth)
+            GLES30.glUniform1f(GLES30.glGetUniformLocation(discProgramId, "uDofHalfWidth"), subjectMask.dofHalfWidth)
             drawBoundQuad()
         }
 
@@ -480,6 +511,10 @@ object GpuStillLutProcessor {
         GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, if (hasValidMask) bgTexDeep else srcTexId)
         GLES30.glUniform1i(GLES30.glGetUniformLocation(programId, "uBgTexDeep"), 4)
 
+        GLES30.glActiveTexture(GLES30.GL_TEXTURE5)
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, depthTexId)
+        GLES30.glUniform1i(GLES30.glGetUniformLocation(programId, "uDepthTex"), 5)
+
         GLES30.glUniform1f(GLES30.glGetUniformLocation(programId, "uLutSize"), lutSize)
         GLES30.glUniform1f(GLES30.glGetUniformLocation(programId, "uLutIntensity"), lutIntensity)
         GLES30.glUniform1f(GLES30.glGetUniformLocation(programId, "uHighlightRolloff"), highlightRolloff)
@@ -491,6 +526,10 @@ object GpuStillLutProcessor {
         GLES30.glUniform2f(GLES30.glGetUniformLocation(programId, "uOutTexelSize"), 1f / outW, 1f / outH)
         GLES30.glUniform1f(GLES30.glGetUniformLocation(programId, "uBokehStrength"), effectiveBokeh)
         GLES30.glUniform1f(GLES30.glGetUniformLocation(programId, "uHasSubject"), if (hasValidMask) 1f else 0f)
+        GLES30.glUniform1f(GLES30.glGetUniformLocation(programId, "uHasDepth"), if (hasValidDepth) 1f else 0f)
+        GLES30.glUniform1f(GLES30.glGetUniformLocation(programId, "uFocusDepth"), subjectMask.focusDepth)
+        GLES30.glUniform1f(GLES30.glGetUniformLocation(programId, "uDofHalfWidth"), subjectMask.dofHalfWidth)
+        GLES30.glUniform1f(GLES30.glGetUniformLocation(programId, "uDofFalloff"), subjectMask.dofFalloff)
         GLES30.glUniform1f(GLES30.glGetUniformLocation(programId, "uContrast"), contrastOffset.toFloat())
         GLES30.glUniform1f(GLES30.glGetUniformLocation(programId, "uSaturation"), saturationOffset.toFloat())
         GLES30.glUniform1f(GLES30.glGetUniformLocation(programId, "uColorTone"), colorToneOffset.toFloat())
@@ -614,11 +653,15 @@ object GpuStillLutProcessor {
 
         uniform sampler2D uInputTex;
         uniform sampler2D uSubjectMaskTex;
+        uniform sampler2D uDepthTex;
         uniform int uRotationMode;
         uniform vec2 uCropScale;
         uniform vec2 uBlurStep;
         uniform int uIsSrcPass;
         uniform float uHasSubject;
+        uniform float uHasDepth;
+        uniform float uFocusDepth;
+        uniform float uDofHalfWidth;
 
         out vec4 fragColor;
 
@@ -641,8 +684,15 @@ object GpuStillLutProcessor {
                 float fk = float(k);
                 float gWeight = exp(-0.5 * (fk * fk) / (3.4 * 3.4));
                 vec2 tapUv = clamp(vScreenUv + uBlurStep * fk, 0.001, 0.999);
-                float subjW = (uHasSubject > 0.5) ? (1.0 - texture(uSubjectMaskTex, tapUv).r * 0.96) : 1.0;
-                float w = gWeight * max(subjW, 0.04);
+                float bgWeight;
+                if (uHasDepth > 0.5) {
+                    float tapD = texture(uDepthTex, tapUv).r;
+                    bgWeight = max(smoothstep(uFocusDepth - uDofHalfWidth * 0.45, uFocusDepth - uDofHalfWidth - 0.08, tapD), 0.015);
+                } else {
+                    float subjW = (uHasSubject > 0.5) ? (1.0 - texture(uSubjectMaskTex, tapUv).r * 0.96) : 1.0;
+                    bgWeight = max(subjW, 0.04);
+                }
+                float w = gWeight * bgWeight;
                 vec2 sampleUv = (uIsSrcPass == 1) ? clamp(screenToTexUv(tapUv), 0.001, 0.999) : tapUv;
                 acc += texture(uInputTex, sampleUv).rgb * w;
                 wSum += w;
@@ -665,7 +715,11 @@ object GpuStillLutProcessor {
 
         uniform sampler2D uBgTexB;
         uniform sampler2D uSubjectMaskTex;
+        uniform sampler2D uDepthTex;
         uniform float uBokehStrength;
+        uniform float uHasDepth;
+        uniform float uFocusDepth;
+        uniform float uDofHalfWidth;
 
         out vec4 fragColor;
 
@@ -692,11 +746,17 @@ object GpuStillLutProcessor {
                 float a = fi * goldenAngle;
                 vec2 off = vec2(cos(a) * r * invAspect, sin(a) * r);
                 vec2 tapUv = clamp(vScreenUv + off, 0.002, 0.998);
-                float tapSubj = texture(uSubjectMaskTex, tapUv).r;
-                float bgOnly = smoothstep(0.85, 0.15, tapSubj) * 0.97 + 0.03;
+                float bgOnly;
+                if (uHasDepth > 0.5) {
+                    float tapD = texture(uDepthTex, tapUv).r;
+                    bgOnly = smoothstep(uFocusDepth - uDofHalfWidth * 0.40, uFocusDepth - uDofHalfWidth - 0.10, tapD) * 0.985 + 0.015;
+                } else {
+                    float tapSubj = texture(uSubjectMaskTex, tapUv).r;
+                    bgOnly = smoothstep(0.85, 0.15, tapSubj) * 0.97 + 0.03;
+                }
 
                 vec3 s = texture(uBgTexB, tapUv).rgb;
-                float specBloom = 1.0 + smoothstep(0.76, 1.0, luminance(s)) * 1.45 * uBokehStrength;
+                float specBloom = 1.0 + smoothstep(0.76, 1.0, luminance(s)) * 1.45 * uBokehStrength * bgOnly;
                 float w = bgOnly * specBloom;
                 acc += s * w;
                 wSum += w;
@@ -718,6 +778,7 @@ object GpuStillLutProcessor {
         uniform sampler2D uSubjectMaskTex;
         uniform sampler2D uBgTexB;
         uniform sampler2D uBgTexDeep;
+        uniform sampler2D uDepthTex;
         uniform int uRotationMode;
         uniform vec2 uCropScale;
         uniform vec2 uOutTexelSize;
@@ -729,6 +790,10 @@ object GpuStillLutProcessor {
         uniform float uSeed;
         uniform float uBokehStrength;
         uniform float uHasSubject;
+        uniform float uHasDepth;
+        uniform float uFocusDepth;
+        uniform float uDofHalfWidth;
+        uniform float uDofFalloff;
         uniform float uContrast;
         uniform float uSaturation;
         uniform float uColorTone;
@@ -789,6 +854,48 @@ object GpuStillLutProcessor {
             return mSum / wSum;
         }
 
+        float sampleRefinedDepth(vec3 centerCol) {
+            float dCenter = texture(uDepthTex, vScreenUv).r;
+            float wSum = 1.0;
+            float dSum = dCenter;
+            float dx = 0.0025 / 1.5;
+            float dy = 0.0025;
+            for (int i = 0; i < 4; i++) {
+                vec2 off = (i == 0) ? vec2(dx, 0.0) :
+                           (i == 1) ? vec2(-dx, 0.0) :
+                           (i == 2) ? vec2(0.0, dy) : vec2(0.0, -dy);
+                vec2 nUv = clamp(vScreenUv + off, 0.001, 0.999);
+                vec3 nCol = texture(uSrcTex, clamp(screenToTexUv(nUv), 0.001, 0.999)).rgb;
+                vec3 diff = nCol - centerCol;
+                float w = exp(-dot(diff, diff) * 65.0) * 0.75;
+                dSum += texture(uDepthTex, nUv).r * w;
+                wSum += w;
+            }
+            return dSum / wSum;
+        }
+
+        vec3 sampleForegroundDisc(vec2 suv, float fgCoC, float bokehStr) {
+            vec3 center = texture(uSrcTex, clamp(screenToTexUv(suv), 0.001, 0.999)).rgb;
+            float radius = 0.014 * bokehStr * fgCoC;
+            if (radius <= 0.0003) return center;
+            vec3 acc = center * 0.14;
+            float wSum = 0.14;
+            const float goldenAngle = 2.39996323;
+            const float invAspect = 1.0 / 1.5;
+            for (int i = 0; i < 12; i++) {
+                float fi = float(i);
+                float r = sqrt((fi + 0.5) / 12.0) * radius;
+                float a = fi * goldenAngle;
+                vec2 tapUv = clamp(suv + vec2(cos(a) * r * invAspect, sin(a) * r), 0.001, 0.999);
+                float tapD = texture(uDepthTex, tapUv).r;
+                float fgOnly = smoothstep(uFocusDepth + uDofHalfWidth * 0.30, uFocusDepth + uDofHalfWidth + 0.06, tapD) * 0.95 + 0.05;
+                vec3 s = texture(uSrcTex, clamp(screenToTexUv(tapUv), 0.001, 0.999)).rgb;
+                acc += s * fgOnly;
+                wSum += fgOnly;
+            }
+            return acc / max(wSum, 0.001);
+        }
+
         vec3 applyPrimeMicroClarity(vec3 centerCol, float clarityWeight) {
             vec3 nL = texture(uSrcTex, clamp(screenToTexUv(vScreenUv - vec2(uOutTexelSize.x, 0.0)), 0.001, 0.999)).rgb;
             vec3 nR = texture(uSrcTex, clamp(screenToTexUv(vScreenUv + vec2(uOutTexelSize.x, 0.0)), 0.001, 0.999)).rgb;
@@ -804,21 +911,48 @@ object GpuStillLutProcessor {
             vec3 raw;
 
             if (uHasSubject > 0.5 && uBokehStrength > 0.01) {
-                float subj = sampleRefinedSubjectMask(centerRaw);
-                vec3 crispSubj = applyPrimeMicroClarity(centerRaw, subj);
-                float blurMask = smoothstep(0.14, 0.82, 1.0 - subj);
+                if (uHasDepth > 0.5) {
+                    float d = sampleRefinedDepth(centerRaw);
+                    float behind = uFocusDepth - d;
+                    float inFront = d - uFocusDepth;
+                    float bgCoC = smoothstep(uDofHalfWidth, uDofHalfWidth + uDofFalloff, behind);
+                    float fgCoC = smoothstep(uDofHalfWidth * 1.10, uDofHalfWidth * 1.10 + uDofFalloff * 1.15, inFront);
 
-                if (blurMask < 0.005) {
-                    raw = crispSubj;
-                } else {
-                    vec3 medBg = texture(uBgTexB, vScreenUv).rgb;
-                    vec3 deepBg = texture(uBgTexDeep, vScreenUv).rgb;
-                    if (blurMask < 0.45) {
-                        float t = smoothstep(0.0, 1.0, blurMask / 0.45);
-                        raw = mix(crispSubj, medBg, t);
+                    if (bgCoC < 0.005 && fgCoC < 0.005) {
+                        raw = applyPrimeMicroClarity(centerRaw, 1.0);
+                    } else if (fgCoC >= bgCoC) {
+                        vec3 sharp = applyPrimeMicroClarity(centerRaw, 1.0 - fgCoC);
+                        vec3 fgBlur = sampleForegroundDisc(vScreenUv, fgCoC, uBokehStrength);
+                        raw = mix(sharp, fgBlur, smoothstep(0.0, 1.0, fgCoC));
                     } else {
-                        float t = (blurMask - 0.45) / 0.55;
-                        raw = mix(medBg, deepBg, t);
+                        vec3 sharp = applyPrimeMicroClarity(centerRaw, 1.0 - bgCoC);
+                        vec3 medBg = texture(uBgTexB, vScreenUv).rgb;
+                        vec3 deepBg = texture(uBgTexDeep, vScreenUv).rgb;
+                        if (bgCoC < 0.34) {
+                            float t = clamp(bgCoC / 0.34, 0.0, 1.0);
+                            raw = mix(sharp, medBg, t);
+                        } else {
+                            float t = (bgCoC - 0.34) / 0.66;
+                            raw = mix(medBg, deepBg, t);
+                        }
+                    }
+                } else {
+                    float subj = sampleRefinedSubjectMask(centerRaw);
+                    vec3 crispSubj = applyPrimeMicroClarity(centerRaw, subj);
+                    float blurMask = smoothstep(0.14, 0.82, 1.0 - subj);
+
+                    if (blurMask < 0.005) {
+                        raw = crispSubj;
+                    } else {
+                        vec3 medBg = texture(uBgTexB, vScreenUv).rgb;
+                        vec3 deepBg = texture(uBgTexDeep, vScreenUv).rgb;
+                        if (blurMask < 0.45) {
+                            float t = smoothstep(0.0, 1.0, blurMask / 0.45);
+                            raw = mix(crispSubj, medBg, t);
+                        } else {
+                            float t = (blurMask - 0.45) / 0.55;
+                            raw = mix(medBg, deepBg, t);
+                        }
                     }
                 }
             } else {

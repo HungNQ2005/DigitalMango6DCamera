@@ -14,6 +14,10 @@ android {
         targetSdk = 35
         versionCode = 1
         versionName = "0.1.0-6d-lab"
+
+        ndk {
+            abiFilters += listOf("arm64-v8a", "armeabi-v7a")
+        }
     }
 
     buildTypes {
@@ -31,7 +35,7 @@ android {
     }
 
     androidResources {
-        noCompress += listOf("wav", "cube")
+        noCompress += listOf("wav", "cube", "onnx")
     }
 
     compileOptions {

@@ -21,7 +21,9 @@ class MlSubjectSegmenter(context: Context) {
         focusNormY: Float,
         lensDiopters: Float,
         @Suppress("UNUSED_PARAMETER") isFocusLocked: Boolean,
-        isAutoMultiPointAf: Boolean = true
+        isAutoMultiPointAf: Boolean = true,
+        apertureF: Float = 2.0f,
+        dofWidthScale: Float = 1.0f
     ): SubjectMaskData {
         return segmenter.segmentStillCapture(
             sourceBitmap = sourceBitmap,
@@ -29,7 +31,9 @@ class MlSubjectSegmenter(context: Context) {
             focusNormX = focusNormX,
             focusNormY = focusNormY,
             lensDiopters = lensDiopters,
-            isAutoMultiPointAf = isAutoMultiPointAf
+            isAutoMultiPointAf = isAutoMultiPointAf,
+            apertureF = apertureF,
+            dofWidthScale = dofWidthScale
         )
     }
 

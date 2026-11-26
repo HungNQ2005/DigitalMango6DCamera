@@ -10,6 +10,7 @@ exifinterface = "1.3.7"
 mlkitSubjectSeg = "16.0.0-beta1"
 mlkitSelfieSeg = "16.0.0-beta6"
 playServicesBase = "18.5.0"
+onnxruntime = "1.32.0"
 
 [libraries]
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
@@ -29,6 +30,7 @@ kotlinx-coroutines-android = { group = "org.jetbrains.kotlinx", name = "kotlinx-
 mlkit-subject-segmentation = { group = "com.google.android.gms", name = "play-services-mlkit-subject-segmentation", version.ref = "mlkitSubjectSeg" }
 mlkit-segmentation-selfie = { group = "com.google.mlkit", name = "segmentation-selfie", version.ref = "mlkitSelfieSeg" }
 play-services-base = { group = "com.google.android.gms", name = "play-services-base", version.ref = "playServicesBase" }
+onnxruntime-android = { group = "com.microsoft.onnxruntime", name = "onnxruntime-android", version.ref = "onnxruntime" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }

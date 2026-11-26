@@ -17,7 +17,11 @@ class SubjectMaskData(
     val maskBytes: ByteArray,
     val width: Int,
     val height: Int,
-    val hasSubject: Boolean
+    val hasSubject: Boolean,
+    val depthBytes: ByteArray? = null,
+    val focusDepth: Float = 0.5f,
+    val dofHalfWidth: Float = 0.085f,
+    val dofFalloff: Float = 0.28f
 ) {
     companion object {
         val NONE = SubjectMaskData(ByteArray(0), 0, 0, false)
