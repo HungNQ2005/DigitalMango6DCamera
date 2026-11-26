@@ -1,6 +1,11 @@
 package com.studio6d.ui.dslr
 
 import android.graphics.SurfaceTexture
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -15,13 +20,18 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -33,6 +43,7 @@ import com.studio6d.core.model.CameraSettingsState
 import com.studio6d.core.model.DslrStops
 import com.studio6d.core.model.FlashMode
 import com.studio6d.core.model.PictureStyle
+import com.studio6d.core.model.PlaybackPhotoItem
 
 /**
  * Production 2-Screen Canon EOS 6D Ergonomic Landscape DSLR Body ("Digital Mango 6D"):
@@ -48,6 +59,7 @@ fun Dslr6dCameraScreen(
     displayRotation: Int,
     sensorAspect: Float,
     capturedUris: List<String>,
+    playbackItems: List<PlaybackPhotoItem> = emptyList(),
     hardwareInfoSummary: String,
     rollAngleDeg: Float = 0f,
     isPassiveFocused: Boolean = true,
@@ -164,17 +176,30 @@ fun Dslr6dCameraScreen(
                 }
 
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    DslrRoundButton(
-                        size = 31.dp,
-                        isActive = state.isPlaybackOpen,
-                        activeAccent = DslrColors.LegendBlue,
-                        onClick = {
-                            onUpdateState {
-                                it.copy(isPlaybackOpen = !it.isPlaybackOpen, isMenuOpen = false, isQMenuOpen = false)
+                    Box {
+                        DslrRoundButton(
+                            size = 31.dp,
+                            isActive = state.isPlaybackOpen,
+                            activeAccent = DslrColors.LegendBlue,
+                            onClick = {
+                                onUpdateState {
+                                    it.copy(isPlaybackOpen = !it.isPlaybackOpen, isMenuOpen = false, isQMenuOpen = false)
+                                }
                             }
+                        ) {
+                            PlaybackTriangleGlyph(color = DslrColors.LegendBlue)
                         }
-                    ) {
-                        PlaybackTriangleGlyph(color = DslrColors.LegendBlue)
+                        if (state.pendingSaveCount > 0) {
+                            Box(
+                                modifier = Modifier
+                                    .align(Alignment.TopEnd)
+                                    .padding(1.dp)
+                                    .size(6.dp)
+                                    .clip(CircleShape)
+                                    .background(Color(0xFFFF2828))
+                                    .border(0.6.dp, Color(0xFF140606), CircleShape)
+                            )
+                        }
                     }
                     DslrRoundButton(
                         size = 31.dp,
@@ -232,6 +257,7 @@ fun Dslr6dCameraScreen(
                         displayRotation = displayRotation,
                         sensorAspect = sensorAspect,
                         capturedUris = capturedUris,
+                        playbackItems = playbackItems,
                         hardwareInfoSummary = hardwareInfoSummary,
                         rollAngleDeg = rollAngleDeg,
                         isPassiveFocused = isPassiveFocused,
@@ -412,6 +438,7 @@ fun Dslr6dCameraScreen(
                                 .clickable { onUpdateState { it.copy(opticalBokehEnabled = !it.opticalBokehEnabled) } }
                                 .padding(horizontal = 6.dp, vertical = 2.5.dp)
                         )
+                        CardAccessLamp(pendingCount = state.pendingSaveCount)
                         LockSwitchLever(
                             isLocked = state.isMultiControlLocked,
                             onToggle = {
@@ -421,6 +448,51 @@ fun Dslr6dCameraScreen(
                     }
                 }
             }
+        }
+    }
+}
+
+/**
+ * Canon EOS 6D Red SD-Card Access Lamp: glows & pulses while capturing/processing/writing to card.
+ */
+@Composable
+private fun CardAccessLamp(pendingCount: Int) {
+    val isBusy = pendingCount > 0
+    val infinite = rememberInfiniteTransition(label = "cardAccessLed")
+    val pulseAlpha by infinite.animateFloat(
+        initialValue = 0.35f,
+        targetValue = 1.0f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 280),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "cardAccessAlpha"
+    )
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(3.dp)
+    ) {
+        Box(
+            modifier = Modifier
+                .size(7.dp)
+                .then(
+                    if (isBusy) Modifier.shadow(4.dp, CircleShape, ambientColor = Color(0xFFFF2828), spotColor = Color(0xFFFF2828))
+                    else Modifier
+                )
+                .clip(CircleShape)
+                .background(if (isBusy) Color(0xFFFF2828).copy(alpha = pulseAlpha) else Color(0xFF2B1214))
+                .border(0.6.dp, Color(0xFF0A0B0E), CircleShape)
+        )
+        if (isBusy) {
+            Text(
+                text = if (pendingCount > 1) "$pendingCount" else "SD",
+                fontSize = 6.5.sp,
+                fontFamily = FontFamily.Monospace,
+                fontWeight = FontWeight.Bold,
+                color = Color(0xFFFF6868),
+                maxLines = 1,
+                softWrap = false
+            )
         }
     }
 }

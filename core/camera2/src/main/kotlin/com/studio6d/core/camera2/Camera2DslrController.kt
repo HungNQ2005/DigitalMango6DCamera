@@ -7,6 +7,7 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.ImageFormat
+import android.graphics.Matrix
 import android.graphics.Rect
 import android.graphics.SurfaceTexture
 import android.hardware.camera2.CameraCaptureSession
@@ -35,6 +36,7 @@ import com.studio6d.core.model.AfMode
 import com.studio6d.core.model.CameraSettingsState
 import com.studio6d.core.model.FlashMode
 import com.studio6d.core.model.MeteringMode
+import com.studio6d.core.model.PlaybackPhotoItem
 import com.studio6d.core.model.WhiteBalancePreset
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -43,6 +45,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -54,6 +57,8 @@ import java.util.Date
 import java.util.Locale
 import java.util.concurrent.ConcurrentLinkedQueue
 import kotlin.math.log2
+import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.pow
 import kotlin.math.roundToInt
 
@@ -119,6 +124,7 @@ class Camera2DslrController(
     private var pendingFocusDeferred: CompletableDeferred<Boolean>? = null
 
     private data class PendingCaptureMeta(
+        val captureId: String,
         val settings: CameraSettingsState,
         val evBiasOverride: Float?,
         val wasFocused: Boolean,
@@ -165,8 +171,113 @@ class Camera2DslrController(
     private val _capturedUris = MutableStateFlow<List<String>>(emptyList())
     val capturedUris: StateFlow<List<String>> = _capturedUris.asStateFlow()
 
+    private val _playbackItems = MutableStateFlow<List<PlaybackPhotoItem>>(emptyList())
+    val playbackItems: StateFlow<List<PlaybackPhotoItem>> = _playbackItems.asStateFlow()
+
+    private val _pendingSaveCount = MutableStateFlow(0)
+    val pendingSaveCount: StateFlow<Int> = _pendingSaveCount.asStateFlow()
+
     init {
         loadExistingPhotos()
+    }
+
+    private fun updatePendingCountFromItems(items: List<PlaybackPhotoItem>) {
+        _pendingSaveCount.value = items.count { it.isPending }
+    }
+
+    private fun addPendingBufferItem(captureId: String) {
+        _playbackItems.update { current ->
+            val updated = if (current.any { it.id == captureId }) {
+                current
+            } else {
+                listOf(PlaybackPhotoItem(id = captureId, isPending = true, statusLabel = "BUFFERING...")) + current
+            }
+            updatePendingCountFromItems(updated)
+            updated
+        }
+    }
+
+    private fun updatePendingBufferPreview(captureId: String, preview: Bitmap, statusLabel: String) {
+        _playbackItems.update { current ->
+            val updated = current.map { item ->
+                if (item.id == captureId) {
+                    item.copy(previewBitmap = preview, statusLabel = statusLabel)
+                } else {
+                    item
+                }
+            }
+            updatePendingCountFromItems(updated)
+            updated
+        }
+    }
+
+    private fun finalizePendingBufferItem(captureId: String, savedUri: String, preview: Bitmap?) {
+        _playbackItems.update { current ->
+            val newItem = PlaybackPhotoItem(
+                id = savedUri,
+                uri = savedUri,
+                previewBitmap = preview,
+                isPending = false,
+                statusLabel = null
+            )
+            val withoutOld = current.filterNot { it.id == captureId || it.id == savedUri }
+            val pending = withoutOld.filter { it.isPending }
+            val existingSaved = withoutOld.filterNot { it.isPending }
+            val mergedSaved = (listOf(newItem) + existingSaved).mapIndexed { index, item ->
+                if (index >= 3 && item.previewBitmap != null) item.copy(previewBitmap = null) else item
+            }
+            val updated = pending + mergedSaved
+            _capturedUris.value = mergedSaved.mapNotNull { it.uri }
+            updatePendingCountFromItems(updated)
+            updated
+        }
+    }
+
+    private fun removePendingBufferItem(captureId: String) {
+        _playbackItems.update { current ->
+            val updated = current.filterNot { it.id == captureId && it.isPending }
+            updatePendingCountFromItems(updated)
+            updated
+        }
+    }
+
+    private fun decodeFastRamPreview(jpegBytes: ByteArray, exifDegrees: Int): Bitmap? {
+        return runCatching {
+            val opts = BitmapFactory.Options().apply {
+                inSampleSize = 6
+                inPreferredConfig = Bitmap.Config.RGB_565
+            }
+            val raw = BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size, opts) ?: return null
+            if (exifDegrees == 0) return raw
+            val m = Matrix().apply { postRotate(exifDegrees.toFloat()) }
+            val rotated = Bitmap.createBitmap(raw, 0, 0, raw.width, raw.height, m, true)
+            if (rotated !== raw) raw.recycle()
+            rotated
+        }.getOrNull()
+    }
+
+    private fun buildSmallGradedPreview(graded: Bitmap): Bitmap? {
+        return runCatching {
+            val w = graded.width
+            val h = graded.height
+            if (w <= 0 || h <= 0) return null
+            val maxDim = max(w, h)
+            if (maxDim <= 960) {
+                return graded.copy(Bitmap.Config.RGB_565, false)
+            }
+            val scale = 960f / maxDim.toFloat()
+            val tw = (w * scale).roundToInt().coerceAtLeast(1)
+            val th = (h * scale).roundToInt().coerceAtLeast(1)
+            if (tw == w && th == h) {
+                return graded.copy(Bitmap.Config.RGB_565, false)
+            }
+            val scaled = Bitmap.createScaledBitmap(graded, tw, th, true)
+            if (scaled === graded) {
+                graded.copy(Bitmap.Config.RGB_565, false)
+            } else {
+                scaled
+            }
+        }.getOrNull()
     }
 
     fun loadExistingPhotos() {
@@ -194,6 +305,23 @@ class Camera2DslrController(
             }
             if (found.isNotEmpty()) {
                 _capturedUris.value = found
+                _playbackItems.update { current ->
+                    val pending = current.filter { it.isPending }
+                    val existingByUri = current.filterNot { it.isPending }.associateBy { it.uri }
+                    val saved = found.mapIndexed { index, uriStr ->
+                        val prev = existingByUri[uriStr]
+                        PlaybackPhotoItem(
+                            id = uriStr,
+                            uri = uriStr,
+                            previewBitmap = if (index < 3) prev?.previewBitmap else null,
+                            isPending = false,
+                            statusLabel = null
+                        )
+                    }
+                    val merged = pending + saved
+                    updatePendingCountFromItems(merged)
+                    merged
+                }
             }
         }
     }
@@ -272,16 +400,33 @@ class Camera2DslrController(
                 } finally {
                     runCatching { image.close() }
                 }
-                val meta = pendingCaptureQueue.poll() ?: PendingCaptureMeta(
-                    settings = activeSettings,
-                    evBiasOverride = null,
-                    wasFocused = _isSubjectFocused.value || _afLocked.value,
-                    diopters = _lensFocusDiopters.value,
-                    flashFired = shouldFireStillFlash(activeSettings) || activeSettings.flashMode == FlashMode.TORCH,
-                    captureTimestampMs = System.currentTimeMillis()
-                )
+                val polled = pendingCaptureQueue.poll()
+                val meta = if (polled != null) {
+                    polled
+                } else {
+                    val fallbackId = "pending_${System.nanoTime()}"
+                    addPendingBufferItem(fallbackId)
+                    PendingCaptureMeta(
+                        captureId = fallbackId,
+                        settings = activeSettings,
+                        evBiasOverride = null,
+                        wasFocused = _isSubjectFocused.value || _afLocked.value,
+                        diopters = _lensFocusDiopters.value,
+                        flashFired = shouldFireStillFlash(activeSettings) || activeSettings.flashMode == FlashMode.TORCH,
+                        captureTimestampMs = System.currentTimeMillis()
+                    )
+                }
                 scope.launch(Dispatchers.Default) {
-                    processAndSaveJpegBytes(bytes, meta)
+                    val exifDegrees = readExifDegrees(bytes)
+                    decodeFastRamPreview(bytes, exifDegrees)?.let { fastPreview ->
+                        val label = if (meta.settings.opticalBokehEnabled && meta.settings.opticalBokehStrength > 0.01f) {
+                            "PROCESSING BOKEH..."
+                        } else {
+                            "PROCESSING..."
+                        }
+                        updatePendingBufferPreview(meta.captureId, fastPreview, label)
+                    }
+                    processAndSaveJpegBytes(bytes, meta, exifDegrees)
                 }
             }, cameraHandler)
         }
@@ -565,7 +710,9 @@ class Camera2DslrController(
         _isAfHunting.value = false
         val fireFlash = shouldFireStillFlash(settings)
         val torchPrewarm = fireFlash && settings.flashMode != FlashMode.TORCH
+        val captureId = "pending_${System.nanoTime()}"
         val meta = PendingCaptureMeta(
+            captureId = captureId,
             settings = settings,
             evBiasOverride = evBiasOverride,
             wasFocused = focusConfirmed || _isSubjectFocused.value || _afLocked.value || settings.afMode == AfMode.MANUAL,
@@ -573,23 +720,28 @@ class Camera2DslrController(
             flashFired = fireFlash || settings.flashMode == FlashMode.TORCH,
             captureTimestampMs = System.currentTimeMillis()
         )
+        addPendingBufferItem(captureId)
         pendingCaptureQueue.offer(meta)
 
         cameraHandler?.post {
             val device = cameraDevice ?: run {
                 pendingCaptureQueue.remove(meta)
+                removePendingBufferItem(meta.captureId)
                 return@post
             }
             val session = captureSession ?: run {
                 pendingCaptureQueue.remove(meta)
+                removePendingBufferItem(meta.captureId)
                 return@post
             }
             val jpegSurface = jpegReader?.surface ?: run {
                 pendingCaptureQueue.remove(meta)
+                removePendingBufferItem(meta.captureId)
                 return@post
             }
             if (!jpegSurface.isValid) {
                 pendingCaptureQueue.remove(meta)
+                removePendingBufferItem(meta.captureId)
                 return@post
             }
             val caps = _capabilities.value
@@ -604,8 +756,13 @@ class Camera2DslrController(
 
             val submitStillCapture = Runnable {
                 runCatching {
-                    val activeDev = cameraDevice ?: return@Runnable
-                    val activeSess = captureSession ?: return@Runnable
+                    val activeDev = cameraDevice
+                    val activeSess = captureSession
+                    if (activeDev == null || activeSess == null) {
+                        pendingCaptureQueue.remove(meta)
+                        removePendingBufferItem(meta.captureId)
+                        return@Runnable
+                    }
                     val builder = activeDev.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
                         // Keep preview stream fed during still ISP processing so Live View never blacks out
                         previewSurface?.takeIf { it.isValid }?.let { addTarget(it) }
@@ -682,6 +839,7 @@ class Camera2DslrController(
                                 cameraHandler?.removeCallbacks(safetyPreviewRestore)
                                 if (!failure.wasImageCaptured()) {
                                     pendingCaptureQueue.remove(meta)
+                                    removePendingBufferItem(meta.captureId)
                                 }
                                 _lastSavedEvent.value = "Capture failed: ${failure.reason}"
                                 if (unlockAfAfterCapture) {
@@ -699,6 +857,7 @@ class Camera2DslrController(
                     captureSettled = true
                     cameraHandler?.removeCallbacks(safetyPreviewRestore)
                     pendingCaptureQueue.remove(meta)
+                    removePendingBufferItem(meta.captureId)
                     applyPreviewLocked(activeSettings)
                 }
             }
@@ -1142,72 +1301,85 @@ class Camera2DslrController(
 
     private suspend fun processAndSaveJpegBytes(
         bytes: ByteArray,
-        meta: PendingCaptureMeta
+        meta: PendingCaptureMeta,
+        exifDegrees: Int
     ) = stillProcessMutex.withLock {
-        val settings = meta.settings
-        val t0 = System.currentTimeMillis()
-        val decodeOpts = BitmapFactory.Options().apply {
-            inPreferredConfig = Bitmap.Config.ARGB_8888
-        }
-        val decoded = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, decodeOpts) ?: run {
-            _lastSavedEvent.value = "Decode error: invalid sensor frame"
-            return@withLock
-        }
-        val exifDegrees = readExifDegrees(bytes)
+        var finalized = false
+        try {
+            val settings = meta.settings
+            val t0 = System.currentTimeMillis()
+            val decodeOpts = BitmapFactory.Options().apply {
+                inPreferredConfig = Bitmap.Config.ARGB_8888
+            }
+            val decoded = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, decodeOpts) ?: run {
+                _lastSavedEvent.value = "Decode error: invalid sensor frame"
+                return@withLock
+            }
 
-        val subjectMask = if (settings.opticalBokehEnabled && settings.opticalBokehStrength > 0.01f) {
-            subjectSegmenter.buildCaptureSubjectMask(
-                sourceBitmap = decoded,
-                exifDegrees = exifDegrees,
-                focusNormX = settings.customFocusNormX,
-                focusNormY = settings.customFocusNormY,
-                lensDiopters = meta.diopters,
-                isFocusLocked = meta.wasFocused,
-                isAutoMultiPointAf = settings.isAutoAfSelection
-            )
-        } else {
-            com.studio6d.core.lut.SubjectMaskData.NONE
-        }
+            val subjectMask = if (settings.opticalBokehEnabled && settings.opticalBokehStrength > 0.01f) {
+                subjectSegmenter.buildCaptureSubjectMask(
+                    sourceBitmap = decoded,
+                    exifDegrees = exifDegrees,
+                    focusNormX = settings.customFocusNormX,
+                    focusNormY = settings.customFocusNormY,
+                    lensDiopters = meta.diopters,
+                    isFocusLocked = meta.wasFocused,
+                    isAutoMultiPointAf = settings.isAutoAfSelection
+                )
+            } else {
+                com.studio6d.core.lut.SubjectMaskData.NONE
+            }
 
-        val graded = try {
-            GpuStillLutProcessor.process(
-                context = context,
-                source = decoded,
-                exifDegrees = exifDegrees,
-                style = settings.pictureStyle,
-                lutIntensity = settings.lutIntensity,
-                highlightRolloff = settings.highlightRolloff,
-                vignetteStrength = settings.simulatedVignetteStrength,
-                grainStrength = settings.simulatedGrainStrength,
-                bokehStrength = settings.opticalBokehStrength,
-                subjectMask = subjectMask,
-                lensDiopters = meta.diopters,
-                contrastOffset = settings.contrastOffset,
-                saturationOffset = settings.saturationOffset,
-                colorToneOffset = settings.colorToneOffset
-            )
+            val graded = try {
+                GpuStillLutProcessor.process(
+                    context = context,
+                    source = decoded,
+                    exifDegrees = exifDegrees,
+                    style = settings.pictureStyle,
+                    lutIntensity = settings.lutIntensity,
+                    highlightRolloff = settings.highlightRolloff,
+                    vignetteStrength = settings.simulatedVignetteStrength,
+                    grainStrength = settings.simulatedGrainStrength,
+                    bokehStrength = settings.opticalBokehStrength,
+                    subjectMask = subjectMask,
+                    lensDiopters = meta.diopters,
+                    contrastOffset = settings.contrastOffset,
+                    saturationOffset = settings.saturationOffset,
+                    colorToneOffset = settings.colorToneOffset
+                )
+            } finally {
+                decoded.recycle()
+            }
+
+            val finalPreview = buildSmallGradedPreview(graded)
+            if (finalPreview != null) {
+                updatePendingBufferPreview(meta.captureId, finalPreview, "SAVING TO CARD...")
+            }
+
+            val stamp = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date(meta.captureTimestampMs))
+            val fileName = "DM6D_${stamp}_${settings.pictureStyle.shortCode}.jpg"
+            val savedUri = try {
+                saveBitmapWithExifToMediaStore(
+                    displayName = fileName,
+                    bitmap = graded,
+                    settings = settings,
+                    evBiasOverride = meta.evBiasOverride,
+                    flashFired = meta.flashFired,
+                    captureTimestampMs = meta.captureTimestampMs
+                )
+            } finally {
+                graded.recycle()
+            }
+            if (savedUri != null) {
+                finalizePendingBufferItem(meta.captureId, savedUri.toString(), finalPreview)
+                finalized = true
+                val elapsedMs = System.currentTimeMillis() - t0
+                _lastSavedEvent.value = "Saved $fileName (${elapsedMs}ms)"
+            }
         } finally {
-            decoded.recycle()
-        }
-
-        val stamp = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date(meta.captureTimestampMs))
-        val fileName = "DM6D_${stamp}_${settings.pictureStyle.shortCode}.jpg"
-        val savedUri = try {
-            saveBitmapWithExifToMediaStore(
-                displayName = fileName,
-                bitmap = graded,
-                settings = settings,
-                evBiasOverride = meta.evBiasOverride,
-                flashFired = meta.flashFired,
-                captureTimestampMs = meta.captureTimestampMs
-            )
-        } finally {
-            graded.recycle()
-        }
-        if (savedUri != null) {
-            _capturedUris.value = listOf(savedUri.toString()) + _capturedUris.value
-            val elapsedMs = System.currentTimeMillis() - t0
-            _lastSavedEvent.value = "Saved $fileName (${elapsedMs}ms)"
+            if (!finalized) {
+                removePendingBufferItem(meta.captureId)
+            }
         }
     }
 
@@ -1407,6 +1579,11 @@ class Camera2DslrController(
                 context.contentResolver.delete(Uri.parse(uriString), null, null)
             }
             _capturedUris.value = _capturedUris.value.filterNot { it == uriString }
+            _playbackItems.update { current ->
+                val updated = current.filterNot { it.uri == uriString || it.id == uriString }
+                updatePendingCountFromItems(updated)
+                updated
+            }
         }
     }
 
@@ -1437,7 +1614,10 @@ class Camera2DslrController(
 
     private fun closeCameraInternal() {
         cancelAfFallbackPulse()
-        pendingCaptureQueue.clear()
+        while (true) {
+            val unreceived = pendingCaptureQueue.poll() ?: break
+            removePendingBufferItem(unreceived.captureId)
+        }
         userAfActive = false
         awaitingAfLock = false
         pendingFocusDeferred?.complete(false)

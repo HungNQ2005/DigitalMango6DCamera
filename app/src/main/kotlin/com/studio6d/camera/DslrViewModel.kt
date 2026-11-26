@@ -18,6 +18,7 @@ import com.studio6d.core.model.ExposureMode
 import com.studio6d.core.model.FlashMode
 import com.studio6d.core.model.MeteringMode
 import com.studio6d.core.model.PictureStyle
+import com.studio6d.core.model.PlaybackPhotoItem
 import com.studio6d.core.model.WhiteBalancePreset
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -36,6 +37,7 @@ class DslrViewModel(application: Application) : AndroidViewModel(application) {
     val state: StateFlow<CameraSettingsState> = _state.asStateFlow()
 
     val capturedUris: StateFlow<List<String>> = cameraController.capturedUris
+    val playbackItems: StateFlow<List<PlaybackPhotoItem>> = cameraController.playbackItems
     val isPassiveFocused: StateFlow<Boolean> = cameraController.isPassiveFocused
 
     private val _capabilities = MutableStateFlow<DslrCameraCapabilities?>(null)
@@ -57,6 +59,11 @@ class DslrViewModel(application: Application) : AndroidViewModel(application) {
     private var autoCaptureInProgress: Boolean = false
 
     init {
+        viewModelScope.launch {
+            cameraController.pendingSaveCount.collect { count ->
+                _state.update { it.copy(pendingSaveCount = count) }
+            }
+        }
         viewModelScope.launch {
             cameraController.capabilities.collect { caps ->
                 _capabilities.value = caps

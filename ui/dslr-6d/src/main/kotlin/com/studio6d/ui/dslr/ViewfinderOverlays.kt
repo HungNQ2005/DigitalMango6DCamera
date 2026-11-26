@@ -3,6 +3,11 @@ package com.studio6d.ui.dslr
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -14,12 +19,16 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Text
@@ -32,6 +41,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
@@ -55,6 +65,7 @@ import com.studio6d.core.model.FlashMode
 import com.studio6d.core.model.GridMode
 import com.studio6d.core.model.MeteringMode
 import com.studio6d.core.model.PictureStyle
+import com.studio6d.core.model.PlaybackPhotoItem
 import com.studio6d.core.model.WhiteBalancePreset
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -762,29 +773,33 @@ private fun MenuToggleRow(
 
 /**
  * In-Body Photo Playback (▶) & Canon-style Erase Confirmation (🗑).
+ * Uses Canon EOS 6D RAM Buffer previews for instant review right after shutter release.
  */
 @Composable
 fun InBodyPlaybackOverlay(
-    uris: List<String>,
+    items: List<PlaybackPhotoItem>,
     onClose: () -> Unit,
     onDeleteUri: (String) -> Unit
 ) {
     val context = LocalContext.current
     var currentIndex by remember { mutableIntStateOf(0) }
     var confirmErase by remember { mutableStateOf(false) }
-    var loadedBitmap by remember { mutableStateOf<Bitmap?>(null) }
+    var decodedDiskBitmap by remember { mutableStateOf<Bitmap?>(null) }
 
-    val safeIndex = currentIndex.coerceIn(0, (uris.size - 1).coerceAtLeast(0))
-    val activeUri = uris.getOrNull(safeIndex)
+    val safeIndex = currentIndex.coerceIn(0, (items.size - 1).coerceAtLeast(0))
+    val activeItem = items.getOrNull(safeIndex)
+    val displayBitmap = activeItem?.previewBitmap ?: decodedDiskBitmap
 
-    LaunchedEffect(activeUri) {
-        if (activeUri == null) {
-            loadedBitmap = null
-        } else {
-            loadedBitmap = withContext(Dispatchers.IO) {
+    LaunchedEffect(activeItem?.id, activeItem?.uri, activeItem?.previewBitmap == null) {
+        val uri = activeItem?.uri
+        if (uri == null) {
+            decodedDiskBitmap = null
+        } else if (activeItem.previewBitmap == null) {
+            decodedDiskBitmap = null
+            decodedDiskBitmap = withContext(Dispatchers.IO) {
                 runCatching {
                     val opts = BitmapFactory.Options().apply { inSampleSize = 4 }
-                    context.contentResolver.openInputStream(Uri.parse(activeUri))?.use { stream ->
+                    context.contentResolver.openInputStream(Uri.parse(uri))?.use { stream ->
                         BitmapFactory.decodeStream(stream, null, opts)
                     }
                 }.getOrNull()
@@ -792,19 +807,43 @@ fun InBodyPlaybackOverlay(
         }
     }
 
+    val pulseTransition = rememberInfiniteTransition(label = "playbackBusyPulse")
+    val busyPulseAlpha by pulseTransition.animateFloat(
+        initialValue = 0.35f,
+        targetValue = 1.0f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 360),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "playbackBusyAlpha"
+    )
+
     Box(
         modifier = Modifier
             .fillMaxSize()
             .background(Color.Black)
     ) {
-        val bmp = loadedBitmap
-        if (uris.isEmpty() || bmp == null) {
+        if (items.isEmpty() || displayBitmap == null) {
             Column(
                 modifier = Modifier.align(Alignment.Center),
-                horizontalAlignment = Alignment.CenterHorizontally
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(6.dp)
             ) {
+                if (activeItem?.isPending == true) {
+                    Box(
+                        modifier = Modifier
+                            .size(8.dp)
+                            .alpha(busyPulseAlpha)
+                            .clip(CircleShape)
+                            .background(Color(0xFFFF2828))
+                    )
+                }
                 Text(
-                    text = if (uris.isEmpty()) "NO IMAGE ON CARD" else "LOADING...",
+                    text = when {
+                        items.isEmpty() -> "NO IMAGE ON CARD"
+                        activeItem?.isPending == true -> activeItem.statusLabel ?: "BUFFERING..."
+                        else -> "LOADING..."
+                    },
                     fontFamily = FontFamily.Monospace,
                     fontWeight = FontWeight.Bold,
                     fontSize = 11.sp,
@@ -813,11 +852,40 @@ fun InBodyPlaybackOverlay(
             }
         } else {
             Image(
-                bitmap = bmp.asImageBitmap(),
+                bitmap = displayBitmap.asImageBitmap(),
                 contentDescription = "Captured Photo",
                 contentScale = ContentScale.Fit,
                 modifier = Modifier.fillMaxSize()
             )
+        }
+
+        if (activeItem?.isPending == true && displayBitmap != null) {
+            Row(
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .padding(bottom = if (items.size > 1) 28.dp else 10.dp)
+                    .clip(RoundedCornerShape(4.dp))
+                    .background(Color(0xCC0D1016))
+                    .border(0.8.dp, Color(0xAAFF2828), RoundedCornerShape(4.dp))
+                    .padding(horizontal = 8.dp, vertical = 3.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(6.dp)
+                        .alpha(busyPulseAlpha)
+                        .clip(CircleShape)
+                        .background(Color(0xFFFF2828))
+                )
+                Spacer(Modifier.width(5.dp))
+                Text(
+                    text = activeItem.statusLabel ?: "SAVING TO CARD...",
+                    fontFamily = FontFamily.Monospace,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 8.5.sp,
+                    color = DslrColors.LegendWhite
+                )
+            }
         }
 
         Row(
@@ -830,14 +898,15 @@ fun InBodyPlaybackOverlay(
             verticalAlignment = Alignment.CenterVertically
         ) {
             Text(
-                text = if (uris.isEmpty()) "PLAYBACK 0/0" else "PLAYBACK ${safeIndex + 1}/${uris.size}",
+                text = if (items.isEmpty()) "PLAYBACK 0/0" else "PLAYBACK ${safeIndex + 1}/${items.size}",
                 fontFamily = FontFamily.Monospace,
                 fontWeight = FontWeight.Bold,
                 fontSize = 9.sp,
                 color = DslrColors.LegendBlue
             )
             Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                if (activeUri != null) {
+                val erasableUri = activeItem?.uri?.takeIf { !activeItem.isPending }
+                if (erasableUri != null) {
                     Text(
                         text = "ERASE",
                         fontFamily = FontFamily.Monospace,
@@ -866,7 +935,7 @@ fun InBodyPlaybackOverlay(
             }
         }
 
-        if (uris.size > 1) {
+        if (items.size > 1) {
             Row(
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
@@ -882,7 +951,7 @@ fun InBodyPlaybackOverlay(
                     fontSize = 10.sp,
                     color = DslrColors.LegendWhite,
                     modifier = Modifier.clickable {
-                        currentIndex = if (safeIndex > 0) safeIndex - 1 else uris.lastIndex
+                        currentIndex = if (safeIndex > 0) safeIndex - 1 else items.lastIndex
                     }
                 )
                 Text(
@@ -892,13 +961,14 @@ fun InBodyPlaybackOverlay(
                     fontSize = 10.sp,
                     color = DslrColors.LegendWhite,
                     modifier = Modifier.clickable {
-                        currentIndex = (safeIndex + 1) % uris.size
+                        currentIndex = (safeIndex + 1) % items.size
                     }
                 )
             }
         }
 
-        if (confirmErase && activeUri != null) {
+        val eraseTargetUri = activeItem?.uri?.takeIf { !activeItem.isPending }
+        if (confirmErase && eraseTargetUri != null) {
             Box(
                 modifier = Modifier
                     .fillMaxSize()
@@ -945,7 +1015,7 @@ fun InBodyPlaybackOverlay(
                                 .background(DslrColors.VfRedAf)
                                 .clickable {
                                     confirmErase = false
-                                    onDeleteUri(activeUri)
+                                    onDeleteUri(eraseTargetUri)
                                 }
                                 .padding(horizontal = 10.dp, vertical = 4.dp)
                         )

@@ -66,6 +66,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             val state by viewModel.state.collectAsState()
             val caps by viewModel.capabilities.collectAsState()
             val capturedUris by viewModel.capturedUris.collectAsState()
+            val playbackItems by viewModel.playbackItems.collectAsState()
             val rotation by viewModel.displayRotation.collectAsState()
             val isPassiveFocused by viewModel.isPassiveFocused.collectAsState()
 
@@ -79,6 +80,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                 displayRotation = rotation,
                 sensorAspect = sensorAspect,
                 capturedUris = capturedUris,
+                playbackItems = playbackItems,
                 hardwareInfoSummary = viewModel.formatHardwareSummary(),
                 rollAngleDeg = rollAngleDeg,
                 isPassiveFocused = isPassiveFocused,

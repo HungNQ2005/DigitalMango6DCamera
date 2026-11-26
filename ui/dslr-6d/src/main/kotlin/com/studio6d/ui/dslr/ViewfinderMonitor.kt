@@ -69,6 +69,7 @@ import com.studio6d.core.model.GridMode
 import com.studio6d.core.model.InfoDisplayMode
 import com.studio6d.core.model.MeteringMode
 import com.studio6d.core.model.PictureStyle
+import com.studio6d.core.model.PlaybackPhotoItem
 import com.studio6d.core.model.WhiteBalancePreset
 import kotlinx.coroutines.delay
 import kotlin.math.hypot
@@ -85,6 +86,7 @@ fun RecessedViewfinderMonitor(
     displayRotation: Int,
     sensorAspect: Float,
     capturedUris: List<String>,
+    playbackItems: List<PlaybackPhotoItem> = emptyList(),
     hardwareInfoSummary: String,
     rollAngleDeg: Float,
     isPassiveFocused: Boolean = true,
@@ -372,7 +374,7 @@ fun RecessedViewfinderMonitor(
                         when {
                             state.isPlaybackOpen -> {
                                 InBodyPlaybackOverlay(
-                                    uris = capturedUris,
+                                    items = playbackItems,
                                     onClose = { onUpdateState { it.copy(isPlaybackOpen = false) } },
                                     onDeleteUri = onDeleteUri
                                 )

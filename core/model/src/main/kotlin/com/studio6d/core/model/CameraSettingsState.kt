@@ -70,6 +70,7 @@ data class CameraSettingsState(
     val isSubjectFocused: Boolean = false,
     val lensFocusDiopters: Float = 0f,
     val isCapturing: Boolean = false,
+    val pendingSaveCount: Int = 0,
     val shutterReflexSeq: Int = 0,
     val remainingShotsEstimate: Int = 428,
     val lastCapturedPath: String? = null,
