@@ -761,6 +761,8 @@ class CameraLutGlRenderer(
         )
 
         private const val VERTEX_SHADER = """#version 300 es
+            precision highp float;
+            precision highp int;
             layout(location = 0) in vec2 aPosition;
             layout(location = 1) in vec2 aTexCoord;
             uniform mat4 uStMatrix;
@@ -794,6 +796,8 @@ class CameraLutGlRenderer(
         """
 
         private const val PASS_V_VERTEX_SHADER = """#version 300 es
+            precision highp float;
+            precision highp int;
             layout(location = 0) in vec2 aPosition;
             layout(location = 1) in vec2 aTexCoord;
             out vec2 vScreenUv;
@@ -807,6 +811,7 @@ class CameraLutGlRenderer(
         private const val LIVE_SEP_H_FRAGMENT_SHADER = """#version 300 es
             #extension GL_OES_EGL_image_external_essl3 : require
             precision highp float;
+            precision highp int;
 
             in vec2 vTexCoord;
             in vec2 vScreenUv;
@@ -861,6 +866,7 @@ class CameraLutGlRenderer(
 
         private const val LIVE_SEP_V_FRAGMENT_SHADER = """#version 300 es
             precision highp float;
+            precision highp int;
 
             in vec2 vScreenUv;
 
@@ -893,6 +899,7 @@ class CameraLutGlRenderer(
         private const val FRAGMENT_SHADER = """#version 300 es
             #extension GL_OES_EGL_image_external_essl3 : require
             precision highp float;
+            precision highp int;
             precision mediump sampler3D;
 
             in vec2 vTexCoord;

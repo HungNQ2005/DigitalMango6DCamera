@@ -311,7 +311,16 @@ class DslrViewModel(application: Application) : AndroidViewModel(application) {
         if (!_state.value.isCameraPoweredOn) return
         isShutterHeldDown = true
         hasAutoFiredForCurrentHold = false
-        _state.update { it.copy(isHalfPressedAfLocked = false, isSubjectFocused = false, isAfHunting = true) }
+        _state.update {
+            it.copy(
+                isHalfPressedAfLocked = false,
+                isSubjectFocused = false,
+                isAfHunting = true,
+                isMenuOpen = false,
+                isQMenuOpen = false,
+                isPlaybackOpen = false
+            )
+        }
         cameraController.triggerHalfPressAfAe(_state.value)
         if (_state.value.soundEnabled && _state.value.afMode != AfMode.MANUAL) {
             soundEngine.startAfHunt()
@@ -326,7 +335,16 @@ class DslrViewModel(application: Application) : AndroidViewModel(application) {
         } else {
             isShutterHeldDown = false
             hasAutoFiredForCurrentHold = false
-            _state.update { it.copy(isHalfPressedAfLocked = false, isSubjectFocused = false, isAfHunting = true) }
+            _state.update {
+                it.copy(
+                    isHalfPressedAfLocked = false,
+                    isSubjectFocused = false,
+                    isAfHunting = true,
+                    isMenuOpen = false,
+                    isQMenuOpen = false,
+                    isPlaybackOpen = false
+                )
+            }
             cameraController.triggerHalfPressAfAe(_state.value)
             if (_state.value.soundEnabled && _state.value.afMode != AfMode.MANUAL) {
                 soundEngine.startAfHunt()

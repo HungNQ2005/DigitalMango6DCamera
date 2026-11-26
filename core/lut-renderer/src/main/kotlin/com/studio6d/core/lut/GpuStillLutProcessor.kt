@@ -580,6 +580,8 @@ object GpuStillLutProcessor {
     )
 
     private const val VERTEX_SHADER = """#version 300 es
+        precision highp float;
+        precision highp int;
         layout(location = 0) in vec2 aPosition;
         layout(location = 1) in vec2 aTexCoord;
         uniform int uRotationMode;
@@ -605,6 +607,7 @@ object GpuStillLutProcessor {
 
     private const val SEP_BLUR_FRAGMENT_SHADER = """#version 300 es
         precision highp float;
+        precision highp int;
 
         in vec2 vTexCoord;
         in vec2 vScreenUv;
@@ -655,6 +658,7 @@ object GpuStillLutProcessor {
 
     private const val DISC_BLOOM_FRAGMENT_SHADER = """#version 300 es
         precision highp float;
+        precision highp int;
 
         in vec2 vTexCoord;
         in vec2 vScreenUv;
@@ -703,6 +707,7 @@ object GpuStillLutProcessor {
 
     private const val FINAL_FRAGMENT_SHADER = """#version 300 es
         precision highp float;
+        precision highp int;
         precision mediump sampler3D;
 
         in vec2 vTexCoord;
