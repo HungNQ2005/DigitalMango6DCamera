@@ -33,7 +33,7 @@ data class DslrCameraCapabilities(
 
 object CameraCapabilitiesInspector {
 
-    private const val MAX_CANON_6D_PIXELS = 21_000_000L
+    private const val MAX_CANON_6D_PIXELS = 16_500_000L
 
     fun inspectBackCamera(cameraManager: CameraManager): DslrCameraCapabilities? {
         val backId = cameraManager.cameraIdList.firstOrNull { id ->

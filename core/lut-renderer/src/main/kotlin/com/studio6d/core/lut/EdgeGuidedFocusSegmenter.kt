@@ -58,9 +58,9 @@ object EdgeGuidedFocusSegmenter {
     ): SubjectMaskData {
         val total = width * height
         if (width < 16 || height < 16 || rgbaBytes.size < total * 4) return SubjectMaskData.NONE
-        // Optical defocus gate: only invoke non-neural MBD segmentation for close-up macro/object focus (< ~1.15m);
-        // medium/far scenes rely strictly on ML Kit neural segmentation so flat monitors/landscapes never get falsely blurred.
-        if (lensDiopters < 0.85f) return SubjectMaskData.NONE
+        // Optical defocus gate: skip distant infinity scenes (> ~2.6m) on calibrated sensors, while
+        // permitting close/tabletop 3D objects (<= 2.6m) and uncalibrated sensors reporting <= 0.01f.
+        if (lensDiopters in 0.01f..0.38f) return SubjectMaskData.NONE
 
         val rArr = FloatArray(total)
         val gArr = FloatArray(total)
@@ -141,8 +141,8 @@ object EdgeGuidedFocusSegmenter {
         val centerC2 = c2Arr[focusIdx]
 
         // 1. Sample diverse foreground prototypes (up to 4) within low-barrier region around (fx, fy)
-        val sampleR = max(rCore + 2, minDim / 7)
-        val fgCandidates = ArrayList<Int>(128)
+        val sampleR = max(rCore + 3, minDim / 5)
+        val fgCandidates = ArrayList<Int>(160)
         for (y in (fy - sampleR).coerceAtLeast(1)..(fy + sampleR).coerceAtMost(height - 2)) {
             for (x in (fx - sampleR).coerceAtLeast(1)..(fx + sampleR).coerceAtMost(width - 2)) {
                 val dx = x - fx
@@ -175,7 +175,7 @@ object EdgeGuidedFocusSegmenter {
         val bgProtos = selectBackgroundPrototypes(bgCandidates, fgProtos, 6, lArr, c1Arr, c2Arr)
         if (bgProtos.isEmpty()) return SubjectMaskData.NONE
 
-        // 3. Dual-Geodesic Minimum-Barrier Distance sweeps (dFg from focus core, dBg from frame borders)
+        // 3. Dual-Geodesic Minimum-Barrier Distance sweeps (dFg from focus core + connected homogeneous object fill, dBg from borders)
         val dFg = FloatArray(total) { 1e4f }
         val dBg = FloatArray(total) { 1e4f }
 
@@ -183,6 +183,40 @@ object EdgeGuidedFocusSegmenter {
             val row = y * width
             for (x in (fx - rCore).coerceAtLeast(0)..(fx + rCore).coerceAtMost(width - 1)) {
                 dFg[row + x] = 0f
+            }
+        }
+
+        // Expand foreground seeds along smooth uniform bodies (e.g., tall cylindrical bottle) within barrier gate
+        val maxFillRadiusSq = (maxDim * 0.36f) * (maxDim * 0.36f)
+        val seedQueue = IntArray(total)
+        val seedVisited = BooleanArray(total)
+        var sHead = 0
+        var sTail = 0
+        seedVisited[focusIdx] = true
+        seedQueue[sTail++] = focusIdx
+        while (sHead < sTail) {
+            val cur = seedQueue[sHead++]
+            dFg[cur] = 0f
+            val cx = cur % width
+            val cy = cur / width
+            for (dy in -1..1) {
+                val ny = cy + dy
+                if (ny <= 1 || ny >= height - 2) continue
+                for (dx in -1..1) {
+                    if (dx == 0 && dy == 0) continue
+                    val nx = cx + dx
+                    if (nx <= 1 || nx >= width - 2) continue
+                    val nIdx = ny * width + nx
+                    if (seedVisited[nIdx]) continue
+                    val rx = (nx - fx).toFloat()
+                    val ry = (ny - fy).toFloat()
+                    if (rx * rx + ry * ry > maxFillRadiusSq) continue
+                    val cDiff = colorDistOpp(lArr[nIdx], c1Arr[nIdx], c2Arr[nIdx], centerL, centerC1, centerC2)
+                    if (cDiff < 0.14f && grad[nIdx] < 0.14f) {
+                        seedVisited[nIdx] = true
+                        seedQueue[sTail++] = nIdx
+                    }
+                }
             }
         }
 
@@ -213,45 +247,62 @@ object EdgeGuidedFocusSegmenter {
         keepFocusConnectedComponent(rawAlpha, width, height, fx, fy)
         fillSmallInteriorHoles(rawAlpha, width, height, maxHoleRatio = 0.12f)
 
-        // 6. Real Optical Defocus Sharpness Gate + foreground/background separation check
-        val lap = FloatArray(total)
-        for (y in 1 until height - 1) {
-            val row = y * width
-            for (x in 1 until width - 1) {
-                val idx = row + x
-                lap[idx] = abs(4f * lArr[idx] - lArr[idx - 1] - lArr[idx + 1] - lArr[idx - width] - lArr[idx + width])
-            }
-        }
-
+        // 6. Contour Boundary Gradient + Closed-Object Border Gate (works for smooth objects & rejects flat screens)
         var fgCount = 0
         var fgAlphaSum = 0f
-        var fgSharpSum = 0f
         var bgAlphaSum = 0f
-        var bgSharpSum = 0f
-        var bgSharpCount = 0
         var bgCount = 0
-        for (i in 0 until total) {
-            val a = rawAlpha[i]
-            if (a >= 0.5f) {
-                fgCount++
-                fgAlphaSum += a
-                fgSharpSum += lap[i]
-            } else {
-                bgCount++
-                bgAlphaSum += a
-                if (a < 0.30f) {
-                    bgSharpSum += lap[i]
-                    bgSharpCount++
+        var boundaryGradSum = 0f
+        var boundaryCount = 0
+        var borderLeakCount = 0
+        var borderTotalCount = 0
+
+        for (y in 0 until height) {
+            val row = y * width
+            val isOuterBorder = y < 2 || y >= height - 2
+            for (x in 0 until width) {
+                val idx = row + x
+                val a = rawAlpha[idx]
+                if (a >= 0.5f) {
+                    fgCount++
+                    fgAlphaSum += a
+                } else {
+                    bgCount++
+                    bgAlphaSum += a
+                }
+                if (isOuterBorder || x < 2 || x >= width - 2) {
+                    borderTotalCount++
+                    if (a >= 0.55f) borderLeakCount++
+                }
+                if (x in 1 until width - 1 && y in 1 until height - 1) {
+                    val isEdgePixel = a in 0.25f..0.75f || (
+                        a >= 0.45f && (
+                            rawAlpha[idx - 1] < 0.45f ||
+                                rawAlpha[idx + 1] < 0.45f ||
+                                rawAlpha[idx - width] < 0.45f ||
+                                rawAlpha[idx + width] < 0.45f
+                            )
+                        )
+                    if (isEdgePixel) {
+                        boundaryGradSum += grad[idx]
+                        boundaryCount++
+                    }
                 }
             }
         }
         val fgRatio = fgCount.toFloat() / total
         val fgMean = if (fgCount > 0) fgAlphaSum / fgCount else 0f
         val bgMean = if (bgCount > 0) bgAlphaSum / bgCount else 1f
-        val fgSharpAvg = if (fgCount > 0) fgSharpSum / fgCount else 0f
-        val bgSharpAvg = if (bgSharpCount > 0) bgSharpSum / bgSharpCount else 0f
-        val hasRealOpticalDefocus = fgSharpAvg >= 0.012f && fgSharpAvg >= bgSharpAvg * 1.45f
-        val hasSubject = fgRatio in 0.015f..0.86f && (fgMean - bgMean) > 0.32f && hasRealOpticalDefocus
+        val boundaryGradAvg = if (boundaryCount > 0) boundaryGradSum / boundaryCount else 0f
+        val borderLeakRatio = if (borderTotalCount > 0) borderLeakCount.toFloat() / borderTotalCount else 1f
+
+        val closeOrUncalibrated = lensDiopters >= 0.38f || lensDiopters <= 0.01f
+        val minBoundaryGrad = if (lensDiopters >= 0.38f) 0.020f else 0.030f
+        val hasSubject = closeOrUncalibrated &&
+            fgRatio in 0.02f..0.78f &&
+            (fgMean - bgMean) > 0.26f &&
+            boundaryGradAvg >= minBoundaryGrad &&
+            borderLeakRatio < 0.44f
         if (!hasSubject) return SubjectMaskData.NONE
 
         val refinedBytes = refineMaskJointBilateral(rawAlpha, rgbaBytes, width, height, radius = 2, passes = 2)

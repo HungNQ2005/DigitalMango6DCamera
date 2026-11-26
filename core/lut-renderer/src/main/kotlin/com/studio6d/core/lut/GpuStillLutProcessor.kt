@@ -66,6 +66,7 @@ object GpuStillLutProcessor {
     private var fboTexId = 0
     private var fboW = 0
     private var fboH = 0
+    private var cachedReadbackBuffer: ByteBuffer? = null
 
     private val lutCache = HashMap<PictureStyle, Pair<Int, Float>>()
 
@@ -80,6 +81,7 @@ object GpuStillLutProcessor {
         grainStrength: Float,
         bokehStrength: Float = 0f,
         subjectMask: SubjectMaskData = SubjectMaskData.NONE,
+        lensDiopters: Float = 1.0f,
         contrastOffset: Int = 0,
         saturationOffset: Int = 0,
         colorToneOffset: Int = 0
@@ -136,6 +138,7 @@ object GpuStillLutProcessor {
                     grainStrength = grainStrength,
                     bokehStrength = bokehStrength,
                     subjectMask = subjectMask,
+                    lensDiopters = lensDiopters,
                     contrastOffset = contrastOffset,
                     saturationOffset = saturationOffset,
                     colorToneOffset = colorToneOffset
@@ -143,21 +146,36 @@ object GpuStillLutProcessor {
             }).get()
         }.getOrElse { err ->
             Log.e(TAG, "GPU still render failed, using CPU fallback: ${err.message}", err)
-            StillLutProcessor.applyStyle(
-                context = context,
-                source = source,
-                exifDegrees = exifDegrees,
-                style = style,
-                lutIntensity = lutIntensity,
-                highlightRolloff = highlightRolloff,
-                vignetteStrength = vignetteStrength,
-                grainStrength = grainStrength,
-                bokehStrength = bokehStrength,
-                subjectMask = subjectMask,
-                contrastOffset = contrastOffset,
-                saturationOffset = saturationOffset,
-                colorToneOffset = colorToneOffset
-            )
+            val cpuInput = if (source.width.toLong() * source.height > 4_500_000L) {
+                val scale = kotlin.math.sqrt(4_500_000.0 / (source.width.toDouble() * source.height))
+                Bitmap.createScaledBitmap(
+                    source,
+                    (source.width * scale).roundToInt().coerceAtLeast(2),
+                    (source.height * scale).roundToInt().coerceAtLeast(2),
+                    true
+                )
+            } else {
+                source
+            }
+            try {
+                StillLutProcessor.applyStyle(
+                    context = context,
+                    source = cpuInput,
+                    exifDegrees = exifDegrees,
+                    style = style,
+                    lutIntensity = lutIntensity,
+                    highlightRolloff = highlightRolloff,
+                    vignetteStrength = vignetteStrength,
+                    grainStrength = grainStrength,
+                    bokehStrength = bokehStrength,
+                    subjectMask = subjectMask,
+                    contrastOffset = contrastOffset,
+                    saturationOffset = saturationOffset,
+                    colorToneOffset = colorToneOffset
+                )
+            } finally {
+                if (cpuInput !== source) cpuInput.recycle()
+            }
         }
     }
 
@@ -317,6 +335,7 @@ object GpuStillLutProcessor {
         grainStrength: Float,
         bokehStrength: Float,
         subjectMask: SubjectMaskData,
+        lensDiopters: Float,
         contrastOffset: Int,
         saturationOffset: Int,
         colorToneOffset: Int
@@ -356,6 +375,9 @@ object GpuStillLutProcessor {
             subjectMask.height > 0 &&
             subjectMask.maskBytes.size >= subjectMask.width * subjectMask.height
 
+        val distanceBoost = (0.80f + 0.45f * (lensDiopters.coerceIn(0.35f, 3.2f) / 2.0f)).coerceIn(0.80f, 1.55f)
+        val effectiveBokeh = if (hasValidMask) (bokehStrength * distanceBoost).coerceIn(0f, 1.15f) else 0f
+
         if (hasValidMask) {
             val maskBuf = ByteBuffer.allocateDirect(subjectMask.maskBytes.size)
                 .order(ByteOrder.nativeOrder())
@@ -369,16 +391,16 @@ object GpuStillLutProcessor {
                 GLES30.GL_RED, GLES30.GL_UNSIGNED_BYTE, maskBuf
             )
 
-            // PASS 1A & 1B: 17x17 Foreground-Excluded Separable Gaussian Background at 1/2 Res
-            val reqHalfW = (outW / 2).coerceAtLeast(320)
-            val reqHalfH = (outH / 2).coerceAtLeast(214)
+            // PASS 1A & 1B: 17x17 Foreground-Excluded Separable Gaussian Background at 1/4 Res
+            val reqHalfW = (outW / 4).coerceAtLeast(240)
+            val reqHalfH = (outH / 4).coerceAtLeast(160)
             val dimsA = ensureFboSize(bgFboA, bgTexA, halfW, halfH, reqHalfW, reqHalfH, "bgFboA")
             val dimsB = ensureFboSize(bgFboB, bgTexB, halfW, halfH, reqHalfW, reqHalfH, "bgFboB")
             halfW = dimsA.first
             halfH = dimsB.second
 
-            val stepX = (0.0022f * bokehStrength) / 1.5f
-            val stepY = 0.0022f * bokehStrength
+            val stepY = 0.0046f * effectiveBokeh
+            val stepX = stepY / 1.5f
 
             // Pass 1A: Horizontal blur from uSrcTex -> bgFboA
             GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, bgFboA)
@@ -407,9 +429,9 @@ object GpuStillLutProcessor {
             GLES30.glUniform1i(GLES30.glGetUniformLocation(sepProgramId, "uIsSrcPass"), 0)
             drawBoundQuad()
 
-            // PASS 1C: 25-tap Dense Optical Disc + Subtle Specular Bloom on bgTexB -> bgFboDeep (1/3 Res)
-            val reqDeepW = (outW / 3).coerceAtLeast(240)
-            val reqDeepH = (outH / 3).coerceAtLeast(160)
+            // PASS 1C: 32-tap Full-Frame Optical Disc + Subtle Specular Bloom on bgTexB -> bgFboDeep (1/6 Res)
+            val reqDeepW = (outW / 6).coerceAtLeast(180)
+            val reqDeepH = (outH / 6).coerceAtLeast(120)
             val dimsDeep = ensureFboSize(bgFboDeep, bgTexDeep, deepW, deepH, reqDeepW, reqDeepH, "bgFboDeep")
             deepW = dimsDeep.first
             deepH = dimsDeep.second
@@ -425,7 +447,7 @@ object GpuStillLutProcessor {
             GLES30.glUniform1i(GLES30.glGetUniformLocation(discProgramId, "uSubjectMaskTex"), 2)
             GLES30.glUniform1i(GLES30.glGetUniformLocation(discProgramId, "uRotationMode"), rotMode)
             GLES30.glUniform2f(GLES30.glGetUniformLocation(discProgramId, "uCropScale"), cropScaleX, cropScaleY)
-            GLES30.glUniform1f(GLES30.glGetUniformLocation(discProgramId, "uBokehStrength"), bokehStrength)
+            GLES30.glUniform1f(GLES30.glGetUniformLocation(discProgramId, "uBokehStrength"), effectiveBokeh)
             drawBoundQuad()
         }
 
@@ -467,7 +489,7 @@ object GpuStillLutProcessor {
         GLES30.glUniform1i(GLES30.glGetUniformLocation(programId, "uRotationMode"), rotMode)
         GLES30.glUniform2f(GLES30.glGetUniformLocation(programId, "uCropScale"), cropScaleX, cropScaleY)
         GLES30.glUniform2f(GLES30.glGetUniformLocation(programId, "uOutTexelSize"), 1f / outW, 1f / outH)
-        GLES30.glUniform1f(GLES30.glGetUniformLocation(programId, "uBokehStrength"), if (hasValidMask) bokehStrength else 0f)
+        GLES30.glUniform1f(GLES30.glGetUniformLocation(programId, "uBokehStrength"), effectiveBokeh)
         GLES30.glUniform1f(GLES30.glGetUniformLocation(programId, "uHasSubject"), if (hasValidMask) 1f else 0f)
         GLES30.glUniform1f(GLES30.glGetUniformLocation(programId, "uContrast"), contrastOffset.toFloat())
         GLES30.glUniform1f(GLES30.glGetUniformLocation(programId, "uSaturation"), saturationOffset.toFloat())
@@ -475,7 +497,14 @@ object GpuStillLutProcessor {
 
         drawBoundQuad()
 
-        val outBuffer = ByteBuffer.allocateDirect(outW * outH * 4).order(ByteOrder.nativeOrder())
+        val neededBytes = outW * outH * 4
+        var outBuffer = cachedReadbackBuffer
+        if (outBuffer == null || outBuffer.capacity() < neededBytes) {
+            outBuffer = ByteBuffer.allocateDirect(neededBytes).order(ByteOrder.nativeOrder())
+            cachedReadbackBuffer = outBuffer
+        }
+        outBuffer!!.clear()
+        outBuffer.limit(neededBytes)
         GLES30.glPixelStorei(GLES30.GL_PACK_ALIGNMENT, 4)
         GLES30.glReadPixels(0, 0, outW, outH, GLES30.GL_RGBA, GLES30.GL_UNSIGNED_BYTE, outBuffer)
         outBuffer.rewind()
@@ -627,6 +656,7 @@ object GpuStillLutProcessor {
     private const val DISC_BLOOM_FRAGMENT_SHADER = """#version 300 es
         precision highp float;
 
+        in vec2 vTexCoord;
         in vec2 vScreenUv;
 
         uniform sampler2D uBgTexB;
@@ -641,20 +671,20 @@ object GpuStillLutProcessor {
 
         void main() {
             vec3 center = texture(uBgTexB, vScreenUv).rgb;
-            float radius = 0.009 * uBokehStrength;
+            float radius = 0.026 * uBokehStrength;
             if (radius <= 0.0004) {
                 fragColor = vec4(center, 1.0);
                 return;
             }
 
-            vec3 acc = center * 0.15;
-            float wSum = 0.15;
+            vec3 acc = center * 0.12;
+            float wSum = 0.12;
             const float goldenAngle = 2.39996323;
             const float invAspect = 1.0 / 1.5;
 
-            for (int i = 0; i < 25; i++) {
+            for (int i = 0; i < 32; i++) {
                 float fi = float(i);
-                float r = sqrt((fi + 0.5) / 25.0) * radius;
+                float r = sqrt((fi + 0.5) / 32.0) * radius;
                 float a = fi * goldenAngle;
                 vec2 off = vec2(cos(a) * r * invAspect, sin(a) * r);
                 vec2 tapUv = clamp(vScreenUv + off, 0.002, 0.998);
@@ -662,7 +692,7 @@ object GpuStillLutProcessor {
                 float bgOnly = smoothstep(0.85, 0.15, tapSubj) * 0.97 + 0.03;
 
                 vec3 s = texture(uBgTexB, tapUv).rgb;
-                float specBloom = 1.0 + smoothstep(0.78, 1.0, luminance(s)) * 1.35 * uBokehStrength;
+                float specBloom = 1.0 + smoothstep(0.76, 1.0, luminance(s)) * 1.45 * uBokehStrength;
                 float w = bgOnly * specBloom;
                 acc += s * w;
                 wSum += w;
@@ -792,6 +822,15 @@ object GpuStillLutProcessor {
 
             vec3 rolled = applyHighlightRolloff(raw, uHighlightRolloff);
             vec3 graded = mix(rolled, sampleLut(rolled), uLutIntensity);
+            graded = clamp((graded - 0.012) / 0.988, 0.0, 1.0);
+            vec3 sCurve = graded * graded * (3.0 - 2.0 * graded);
+            graded = mix(graded, sCurve, 0.16);
+            float lumG = luminance(graded);
+            float maxC = max(graded.r, max(graded.g, graded.b));
+            float minC = min(graded.r, min(graded.g, graded.b));
+            float satG = maxC - minC;
+            float vibWeight = (1.0 - smoothstep(0.35, 0.85, satG)) * 0.14;
+            graded = clamp(mix(vec3(lumG), graded, 1.0 + vibWeight), 0.0, 1.0);
 
             if (abs(uContrast) > 0.05) {
                 float cFactor = 1.0 + uContrast * 0.08;

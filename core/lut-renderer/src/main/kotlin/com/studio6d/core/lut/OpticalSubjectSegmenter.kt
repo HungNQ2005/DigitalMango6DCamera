@@ -4,19 +4,10 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Matrix
-import com.google.android.gms.common.moduleinstall.ModuleInstall
-import com.google.android.gms.common.moduleinstall.ModuleInstallRequest
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.segmentation.Segmentation
 import com.google.mlkit.vision.segmentation.selfie.SelfieSegmenterOptions
-import com.google.mlkit.vision.segmentation.subject.SubjectSegmentation
-import com.google.mlkit.vision.segmentation.subject.SubjectSegmentationResult
-import com.google.mlkit.vision.segmentation.subject.SubjectSegmenterOptions
 import com.studio6d.core.model.AfPoints6D
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withTimeoutOrNull
 import java.nio.ByteBuffer
@@ -30,53 +21,17 @@ import kotlin.math.roundToInt
 import kotlin.math.sqrt
 
 /**
- * Unified 3-Tier Object-Silhouette Segmenter & Canon 11-Point Saliency Detector:
- * - Tier 1: Google ML Kit Subject Segmentation (Multi-subject union in Auto AF mode, or point-locked subject in Single-Point AF)
- * - Tier 2: Offline bundled ML Kit Selfie Segmentation (STREAM_MODE for Live View, SINGLE_IMAGE_MODE for Stills)
- * - Tier 3: EdgeGuidedFocusSegmenter Dual-Geodesic Barrier + Real Optical Defocus Gate (close-ups only, never flat screens)
+ * Unified 2-Tier Object-Silhouette Segmenter & Canon 11-Point Saliency Detector:
+ * - Tier 1: Offline bundled ML Kit Selfie Segmentation (STREAM_MODE for Live View, SINGLE_IMAGE_MODE for Stills)
+ * - Tier 2: EdgeGuidedFocusSegmenter Dual-Geodesic Barrier + Real Optical Defocus Gate (never flat screens)
  * Followed by Joint Bilateral RGB edge-snapping so the mask strictly follows real subject contours.
  */
-class OpticalSubjectSegmenter private constructor(context: Context) {
+class OpticalSubjectSegmenter private constructor(@Suppress("UNUSED_PARAMETER") context: Context) {
 
-    private val appContext = context.applicationContext
-
-    private val bgScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-
-    private val subjectInFlight = AtomicBoolean(false)
     private val liveSelfieInFlight = AtomicBoolean(false)
     private val stillSelfieInFlight = AtomicBoolean(false)
-
-    @Volatile
-    private var subjectModuleAvailable = false
-
-    @Volatile
-    private var lastModuleInstallAttemptMs = 0L
-
-    @Volatile
-    private var cachedLiveSubjectAlphas: FloatArray? = null
-
-    @Volatile
-    private var cachedLiveW = 0
-
-    @Volatile
-    private var cachedLiveH = 0
-
-    @Volatile
-    private var cachedLiveTimestampMs = 0L
-
-    @Volatile
-    private var lastLiveSubjectAttemptMs = 0L
-
-    private val subjectSegmenter = SubjectSegmentation.getClient(
-        SubjectSegmenterOptions.Builder()
-            .enableForegroundConfidenceMask()
-            .enableMultipleSubjects(
-                SubjectSegmenterOptions.SubjectResultOptions.Builder()
-                    .enableConfidenceMask()
-                    .build()
-            )
-            .build()
-    )
+    private var livePixels = IntArray(0)
+    private var liveBitmap: Bitmap? = null
 
     private val liveSelfieSegmenter = Segmentation.getClient(
         SelfieSegmenterOptions.Builder()
@@ -92,40 +47,6 @@ class OpticalSubjectSegmenter private constructor(context: Context) {
             .build()
     )
 
-    init {
-        checkAndRequestSubjectModuleThrottled()
-    }
-
-    private fun checkAndRequestSubjectModuleThrottled() {
-        val now = System.currentTimeMillis()
-        if (now - lastModuleInstallAttemptMs < 15_000L) return
-        lastModuleInstallAttemptMs = now
-        runCatching {
-            val client = ModuleInstall.getClient(appContext)
-            client.areModulesAvailable(subjectSegmenter)
-                .addOnSuccessListener { avail ->
-                    if (avail.areModulesAvailable()) {
-                        subjectModuleAvailable = true
-                    } else {
-                        val req = ModuleInstallRequest.newBuilder()
-                            .addApi(subjectSegmenter)
-                            .build()
-                        client.installModules(req)
-                            .addOnSuccessListener { resp ->
-                                if (resp.areModulesAlreadyInstalled()) {
-                                    subjectModuleAvailable = true
-                                } else {
-                                    client.areModulesAvailable(subjectSegmenter)
-                                        .addOnSuccessListener { recheck ->
-                                            subjectModuleAvailable = recheck.areModulesAvailable()
-                                        }
-                                }
-                            }
-                    }
-                }
-        }
-    }
-
     suspend fun segmentLiveFrame(
         uprightRgba: ByteArray,
         width: Int,
@@ -138,13 +59,14 @@ class OpticalSubjectSegmenter private constructor(context: Context) {
         val total = width * height
         if (width < 16 || height < 16 || uprightRgba.size < total * 4) return SubjectMaskData.NONE
 
-        // NOTE: Never call Bitmap.recycle() manually on bitmaps handed to ML Kit InputImage;
-        // NativeAllocationRegistry releases pixels safely once async ML Kit native workers complete.
-        val bmp = rgbaToBitmap(uprightRgba, width, height)
-
-        // Tier 2 (Fast Bundled STREAM_MODE Selfie Segmenter ~15ms for Live View)
-        val selfieAlphas = withTimeoutOrNull(85L) {
-            runSelfieSegmentation(bmp, focusNormX, focusNormY, isAutoMultiPointAf, isLiveStream = true)
+        // Tier 1: Fast Bundled STREAM_MODE Selfie Segmenter (~15ms for Live View) with reusable Bitmap/IntArray
+        val selfieAlphas = if (!liveSelfieInFlight.get()) {
+            val bmp = obtainLiveBitmap(uprightRgba, width, height)
+            withTimeoutOrNull(85L) {
+                runSelfieSegmentation(bmp, focusNormX, focusNormY, isAutoMultiPointAf, isLiveStream = true)
+            }
+        } else {
+            null
         }
         if (selfieAlphas != null) {
             val polished = EdgeGuidedFocusSegmenter.refineMaskJointBilateral(
@@ -158,39 +80,7 @@ class OpticalSubjectSegmenter private constructor(context: Context) {
             return SubjectMaskData(polished, width, height, hasSubject = true)
         }
 
-        // Tier 1 (Async throttled GMS Subject Segmentation refresh without stalling 60fps Live View)
-        val now = System.currentTimeMillis()
-        if (subjectModuleAvailable && !subjectInFlight.get() && now - lastLiveSubjectAttemptMs >= 900L) {
-            lastLiveSubjectAttemptMs = now
-            bgScope.launch {
-                val subj = runSubjectSegmentation(bmp, focusNormX, focusNormY, isAutoMultiPointAf)
-                if (subj != null) {
-                    cachedLiveSubjectAlphas = subj
-                    cachedLiveW = width
-                    cachedLiveH = height
-                    cachedLiveTimestampMs = System.currentTimeMillis()
-                }
-            }
-        } else if (!subjectModuleAvailable) {
-            checkAndRequestSubjectModuleThrottled()
-        }
-
-        val cached = cachedLiveSubjectAlphas
-        if (cached != null && cachedLiveW == width && cachedLiveH == height &&
-            cached.size == total && (now - cachedLiveTimestampMs) < 1800L
-        ) {
-            val polished = EdgeGuidedFocusSegmenter.refineMaskJointBilateral(
-                alphaIn = cached,
-                rgbaBytes = uprightRgba,
-                width = width,
-                height = height,
-                radius = 2,
-                passes = 1
-            )
-            return SubjectMaskData(polished, width, height, hasSubject = true)
-        }
-
-        // Tier 3 (Real-time Edge-Guided + Optical Defocus Gate fallback)
+        // Tier 2: Real-time Edge-Guided + Optical Defocus Gate fallback for 3D objects
         return EdgeGuidedFocusSegmenter.computeSubjectMask(
             rgbaBytes = uprightRgba,
             width = width,
@@ -199,6 +89,30 @@ class OpticalSubjectSegmenter private constructor(context: Context) {
             focusNormY = focusNormY,
             lensDiopters = lensDiopters
         )
+    }
+
+    private fun obtainLiveBitmap(rgba: ByteArray, w: Int, h: Int): Bitmap {
+        val total = w * h
+        if (livePixels.size != total) {
+            livePixels = IntArray(total)
+        }
+        var p = 0
+        for (i in 0 until total) {
+            val r = rgba[p].toInt() and 0xFF
+            val g = rgba[p + 1].toInt() and 0xFF
+            val b = rgba[p + 2].toInt() and 0xFF
+            val a = rgba[p + 3].toInt() and 0xFF
+            p += 4
+            livePixels[i] = (a shl 24) or (r shl 16) or (g shl 8) or b
+        }
+        val existing = liveBitmap
+        val bmp = if (existing != null && !existing.isRecycled && existing.width == w && existing.height == h) {
+            existing
+        } else {
+            Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888).also { liveBitmap = it }
+        }
+        bmp.setPixels(livePixels, 0, w, 0, 0, w, h)
+        return bmp
     }
 
     suspend fun segmentStillCapture(
@@ -217,26 +131,7 @@ class OpticalSubjectSegmenter private constructor(context: Context) {
         thumb.copyPixelsToBuffer(rgbaBuf)
         val uprightRgba = rgbaBuf.array()
 
-        if (subjectModuleAvailable) {
-            val subjAlphas = withTimeoutOrNull(1100L) {
-                runSubjectSegmentation(thumb, focusNormX, focusNormY, isAutoMultiPointAf)
-            }
-            if (subjAlphas != null) {
-                val polished = EdgeGuidedFocusSegmenter.refineMaskJointBilateral(
-                    alphaIn = subjAlphas,
-                    rgbaBytes = uprightRgba,
-                    width = w,
-                    height = h,
-                    radius = 2,
-                    passes = 2
-                )
-                return SubjectMaskData(polished, w, height = h, hasSubject = true)
-            }
-        } else {
-            checkAndRequestSubjectModuleThrottled()
-        }
-
-        val selfieAlphas = withTimeoutOrNull(400L) {
+        val selfieAlphas = withTimeoutOrNull(450L) {
             runSelfieSegmentation(thumb, focusNormX, focusNormY, isAutoMultiPointAf, isLiveStream = false)
         }
         if (selfieAlphas != null) {
@@ -331,6 +226,8 @@ class OpticalSubjectSegmenter private constructor(context: Context) {
             var lapSum = 0f
             var colPopSum = 0f
             var maskSum = 0f
+            var lumaSum = 0f
+            var maxLocalGrad = 0f
             var count = 0
 
             val y0 = (cy - radY).coerceAtLeast(1)
@@ -344,6 +241,9 @@ class OpticalSubjectSegmenter private constructor(context: Context) {
                     val idx = row + x
                     val lap = abs(4f * luma[idx] - luma[idx - 1] - luma[idx + 1] - luma[idx - width] - luma[idx + width])
                     lapSum += lap
+                    val gLoc = (abs(luma[idx + 1] - luma[idx - 1]) + abs(luma[idx + width] - luma[idx - width])) * 0.5f
+                    if (gLoc > maxLocalGrad) maxLocalGrad = gLoc
+                    lumaSum += luma[idx]
                     val dr = rArr[idx] - borderR
                     val dg = gArr[idx] - borderG
                     val db = bArr[idx] - borderB
@@ -361,200 +261,39 @@ class OpticalSubjectSegmenter private constructor(context: Context) {
 
             val avgContrast = lapSum / count
             val avgPop = colPopSum / count
+            val avgLuma = lumaSum / count
             val avgMask = if (hasMask) maskSum / count else 0f
             if (avgContrast > maxContrast) maxContrast = avgContrast
 
-            val centerBias = if (pt.isCrossType) 1.15f else 1.0f
-            val baseScore = if (hasMask) {
-                avgMask * 1.85f + avgContrast * 2.2f + avgPop * 0.45f
-            } else {
-                avgContrast * 3.2f + avgPop * 0.65f
+            val glarePenalty = if (avgLuma > 0.86f) 0.22f else if (avgLuma < 0.04f) 0.50f else 1.0f
+            val centerBias = when {
+                pt.index == 5 -> 1.65f
+                pt.index in listOf(2, 4, 6, 8) -> 1.25f
+                pt.index in listOf(1, 3, 7, 9) -> 1.12f
+                else -> 0.92f
             }
-            val score = baseScore * centerBias
+            val baseScore = if (hasMask) {
+                avgMask * 1.95f + avgContrast * 1.4f + maxLocalGrad * 0.85f + avgPop * 0.45f
+            } else {
+                avgContrast * 1.8f + maxLocalGrad * 1.6f + avgPop * 0.75f
+            }
+            val score = baseScore * centerBias * glarePenalty
             if (score > maxScore) maxScore = score
             scored.add(pt.index to score)
         }
 
-        if (maxScore <= 0.001f || (!hasMask && maxContrast < 0.018f)) {
+        if (maxScore <= 0.001f || (!hasMask && maxContrast < 0.015f)) {
             return listOf(5)
         }
 
-        val threshold = maxScore * 0.58f
+        val threshold = maxScore * 0.68f
         val selected = scored
             .filter { it.second >= threshold }
             .sortedByDescending { it.second }
-            .take(4)
+            .take(3)
             .map { it.first }
 
         return selected.ifEmpty { listOf(5) }
-    }
-
-    private suspend fun runSubjectSegmentation(
-        bitmap: Bitmap,
-        focusNormX: Float,
-        focusNormY: Float,
-        isAutoMultiPointAf: Boolean
-    ): FloatArray? {
-        if (!subjectInFlight.compareAndSet(false, true)) return null
-        return suspendCancellableCoroutine { cont ->
-            val input = InputImage.fromBitmap(bitmap, 0)
-            try {
-                subjectSegmenter.process(input)
-                    .addOnCompleteListener { task ->
-                        @Suppress("UNUSED_VARIABLE")
-                        val keepAlive = bitmap
-                        try {
-                            if (task.isSuccessful) {
-                                val alphas = extractFocusedSubjectAlphas(
-                                    result = task.result,
-                                    w = bitmap.width,
-                                    h = bitmap.height,
-                                    focusNormX = focusNormX,
-                                    focusNormY = focusNormY,
-                                    isAutoMultiPointAf = isAutoMultiPointAf
-                                )
-                                if (cont.isActive) cont.resume(alphas)
-                            } else {
-                                subjectModuleAvailable = false
-                                checkAndRequestSubjectModuleThrottled()
-                                if (cont.isActive) cont.resume(null)
-                            }
-                        } catch (_: Throwable) {
-                            if (cont.isActive) cont.resume(null)
-                        } finally {
-                            subjectInFlight.set(false)
-                        }
-                    }
-            } catch (_: Throwable) {
-                subjectInFlight.set(false)
-                if (cont.isActive) cont.resume(null)
-            }
-        }
-    }
-
-    private fun extractFocusedSubjectAlphas(
-        result: SubjectSegmentationResult,
-        w: Int,
-        h: Int,
-        focusNormX: Float,
-        focusNormY: Float,
-        isAutoMultiPointAf: Boolean
-    ): FloatArray? {
-        val total = w * h
-
-        if (isAutoMultiPointAf) {
-            // Multi-subject union keeps all detected subjects (e.g., multiple people) sharp
-            val fgBuf = result.foregroundConfidenceMask
-            if (fgBuf != null) {
-                fgBuf.rewind()
-                if (fgBuf.remaining() >= total) {
-                    val fgOut = FloatArray(total)
-                    for (i in 0 until total) {
-                        fgOut[i] = fgBuf.get().coerceIn(0f, 1f)
-                    }
-                    if (isValidOverallForeground(fgOut)) {
-                        return fgOut
-                    }
-                }
-            }
-            if (result.subjects.isNotEmpty()) {
-                val union = FloatArray(total)
-                for (subj in result.subjects) {
-                    accumulateSubjectMask(subj, union, w, h)
-                }
-                if (isValidOverallForeground(union)) {
-                    return union
-                }
-            }
-            return null
-        }
-
-        // Single-point AF mode: prioritize subjects overlapping the tapped AF coordinate
-        val fx = (focusNormX.coerceIn(0.02f, 0.98f) * w).roundToInt().coerceIn(0, w - 1)
-        val fy = (focusNormY.coerceIn(0.02f, 0.98f) * h).roundToInt().coerceIn(0, h - 1)
-        val rad = max(3, min(w, h) / 14)
-
-        val focusedSubjects = ArrayList<com.google.mlkit.vision.segmentation.subject.Subject>()
-        for (subj in result.subjects) {
-            val mask = subj.confidenceMask ?: continue
-            val sx = subj.startX
-            val sy = subj.startY
-            val sw = subj.width
-            val sh = subj.height
-            if (sw <= 0 || sh <= 0) continue
-
-            val yLo = max(sy, fy - rad)
-            val yHi = min(sy + sh - 1, fy + rad)
-            val xLo = max(sx, fx - rad)
-            val xHi = min(sx + sw - 1, fx + rad)
-            if (xLo > xHi || yLo > yHi) continue
-
-            mask.rewind()
-            var maxConf = 0f
-            for (y in yLo..yHi) {
-                val localY = y - sy
-                for (x in xLo..xHi) {
-                    val localX = x - sx
-                    val idx = localY * sw + localX
-                    if (idx in 0 until mask.limit()) {
-                        val c = mask.get(idx).coerceIn(0f, 1f)
-                        if (c > maxConf) maxConf = c
-                    }
-                }
-            }
-            if (maxConf >= 0.18f) {
-                focusedSubjects.add(subj)
-            }
-        }
-
-        if (focusedSubjects.isNotEmpty()) {
-            val out = FloatArray(total)
-            for (subj in focusedSubjects) {
-                accumulateSubjectMask(subj, out, w, h)
-            }
-            if (isValidNeuralMaskNearPoint(out, w, h, fx, fy, rad, minConf = 0.18f)) {
-                return out
-            }
-        }
-
-        val fgBuf = result.foregroundConfidenceMask ?: return null
-        fgBuf.rewind()
-        if (fgBuf.remaining() < total) return null
-        val fgOut = FloatArray(total)
-        for (i in 0 until total) {
-            fgOut[i] = fgBuf.get().coerceIn(0f, 1f)
-        }
-        return if (isValidNeuralMaskNearPoint(fgOut, w, h, fx, fy, rad, minConf = 0.20f)) fgOut else null
-    }
-
-    private fun accumulateSubjectMask(
-        subj: com.google.mlkit.vision.segmentation.subject.Subject,
-        out: FloatArray,
-        w: Int,
-        h: Int
-    ) {
-        val mask = subj.confidenceMask ?: return
-        val sx = subj.startX
-        val sy = subj.startY
-        val sw = subj.width
-        val sh = subj.height
-        mask.rewind()
-        for (ly in 0 until sh) {
-            val gy = sy + ly
-            if (gy !in 0 until h) continue
-            val outRow = gy * w
-            val srcRow = ly * sw
-            for (lx in 0 until sw) {
-                val gx = sx + lx
-                if (gx !in 0 until w) continue
-                val srcIdx = srcRow + lx
-                if (srcIdx < mask.limit()) {
-                    val c = mask.get(srcIdx).coerceIn(0f, 1f)
-                    val outIdx = outRow + gx
-                    if (c > out[outIdx]) out[outIdx] = c
-                }
-            }
-        }
     }
 
     private suspend fun runSelfieSegmentation(

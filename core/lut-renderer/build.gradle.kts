@@ -24,7 +24,5 @@ dependencies {
     implementation(project(":core:model"))
     implementation(libs.androidx.core.ktx)
     implementation(libs.kotlinx.coroutines.android)
-    implementation(libs.mlkit.subject.segmentation)
     implementation(libs.mlkit.segmentation.selfie)
-    implementation(libs.play.services.base)
 }

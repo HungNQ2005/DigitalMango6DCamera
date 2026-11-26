@@ -82,8 +82,9 @@ class CameraLutGlRenderer(
     private var histFboId = 0
     private var histTexId = 0
     private var histFrameCounter = 0
+    private var segFrameCounter = 0
     private val histPixelBuffer = ByteBuffer.allocateDirect(MASK_W * MASK_H * 4).order(ByteOrder.nativeOrder())
-    private val uprightRgba = ByteArray(MASK_W * MASK_H * 4)
+    private val workerRgba = ByteArray(MASK_W * MASK_H * 4)
     private val maskUploadBuffer = ByteBuffer.allocateDirect(MASK_W * MASK_H).order(ByteOrder.nativeOrder())
     private val smoothMask = FloatArray(MASK_W * MASK_H) { 0f }
 
@@ -141,7 +142,7 @@ class CameraLutGlRenderer(
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
         programId = createProgram(VERTEX_SHADER, FRAGMENT_SHADER)
         liveSepHProgramId = createProgram(VERTEX_SHADER, LIVE_SEP_H_FRAGMENT_SHADER)
-        liveSepVProgramId = createProgram(VERTEX_SHADER, LIVE_SEP_V_FRAGMENT_SHADER)
+        liveSepVProgramId = createProgram(PASS_V_VERTEX_SHADER, LIVE_SEP_V_FRAGMENT_SHADER)
 
         uStMatrixLoc = GLES30.glGetUniformLocation(programId, "uStMatrix")
         uCameraTexLoc = GLES30.glGetUniformLocation(programId, "uCameraTex")
@@ -196,6 +197,8 @@ class CameraLutGlRenderer(
         val st = surfaceTexture ?: return
         val hadNewFrame = frameAvailable.compareAndSet(true, false)
         if (hadNewFrame) {
+            // Keep SurfaceTexture bound strictly to GL_TEXTURE0 so it never overwrites GL_TEXTURE3 (blurTexB)
+            GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
             st.updateTexImage()
             st.getTransformMatrix(stMatrix)
         }
@@ -232,8 +235,9 @@ class CameraLutGlRenderer(
         val zCenterY = (1f - zoomCenterY).coerceIn(halfSpan, 1f - halfSpan)
 
         val canBokeh = isSubjectFocused && bokehStrength > 0.01f && hasValidLiveSubjectMask
+        val readyBokeh = canBokeh && liveSepHProgramId != 0 && liveSepVProgramId != 0 && blurFboA != 0 && blurFboB != 0
 
-        if (canBokeh && liveSepHProgramId != 0 && liveSepVProgramId != 0 && blurFboA != 0 && blurFboB != 0) {
+        if (readyBokeh) {
             renderSeparableLiveBlur(
                 rotMode = rotMode,
                 cropScaleX = cropScaleX,
@@ -256,8 +260,8 @@ class CameraLutGlRenderer(
             zCenterY = zCenterY,
             enablePeaking = focusPeakingEnabled,
             enableAlert = highlightAlertEnabled,
-            enableBokeh = if (canBokeh) bokehStrength else 0f,
-            hasSubject = canBokeh,
+            enableBokeh = if (readyBokeh) bokehStrength else 0f,
+            hasSubject = readyBokeh,
             texelW = 1f / viewportWidth,
             texelH = 1f / viewportHeight
         )
@@ -269,6 +273,10 @@ class CameraLutGlRenderer(
         if (hadNewFrame && histFboId != 0) {
             histFrameCounter = (histFrameCounter + 1) % 6
             if (histFrameCounter == 0 || newlyFocused) {
+                if (histFrameCounter == 0) {
+                    segFrameCounter = (segFrameCounter + 1) % 3
+                }
+                val dispatchSeg = newlyFocused || segFrameCounter == 0
                 sampleHistogramAndSubjectMask(
                     rotMode = rotMode,
                     cropScaleX = cropScaleX,
@@ -276,7 +284,8 @@ class CameraLutGlRenderer(
                     z = z,
                     zCenterX = zCenterX,
                     zCenterY = zCenterY,
-                    callback = if (histFrameCounter == 0) callback else null
+                    callback = if (histFrameCounter == 0) callback else null,
+                    dispatchSeg = dispatchSeg
                 )
             }
         }
@@ -296,16 +305,18 @@ class CameraLutGlRenderer(
         if (blurW != targetW || blurH != targetH) {
             blurW = targetW
             blurH = targetH
+            GLES30.glActiveTexture(GLES30.GL_TEXTURE4)
             GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, blurTexA)
             GLES30.glTexImage2D(GLES30.GL_TEXTURE_2D, 0, GLES30.GL_RGBA8, blurW, blurH, 0, GLES30.GL_RGBA, GLES30.GL_UNSIGNED_BYTE, null)
+            GLES30.glActiveTexture(GLES30.GL_TEXTURE3)
             GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, blurTexB)
             GLES30.glTexImage2D(GLES30.GL_TEXTURE_2D, 0, GLES30.GL_RGBA8, blurW, blurH, 0, GLES30.GL_RGBA, GLES30.GL_UNSIGNED_BYTE, null)
         }
 
-        val stepX = (0.0028f * bokehStrength) / aspect.coerceAtLeast(0.5f)
-        val stepY = 0.0028f * bokehStrength
+        val stepX = (0.0050f * bokehStrength) / aspect.coerceAtLeast(0.5f)
+        val stepY = 0.0050f * bokehStrength
 
-        // Pass H: OES -> blurFboA
+        // Pass H: OES (unit 0) -> blurFboA
         GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, blurFboA)
         GLES30.glViewport(0, 0, blurW, blurH)
         GLES30.glUseProgram(liveSepHProgramId)
@@ -323,18 +334,19 @@ class CameraLutGlRenderer(
         GLES30.glUniform1f(GLES30.glGetUniformLocation(liveSepHProgramId, "uStepX"), stepX)
         drawQuadGeometry()
 
-        // Pass V: blurTexA -> blurFboB
+        // Pass V: blurTexA (unit 4, isolated from OES unit 0) -> blurFboB
         GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, blurFboB)
         GLES30.glViewport(0, 0, blurW, blurH)
         GLES30.glUseProgram(liveSepVProgramId)
-        GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
+        GLES30.glActiveTexture(GLES30.GL_TEXTURE4)
         GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, blurTexA)
-        GLES30.glUniform1i(GLES30.glGetUniformLocation(liveSepVProgramId, "uInputTex"), 0)
+        GLES30.glUniform1i(GLES30.glGetUniformLocation(liveSepVProgramId, "uInputTex"), 4)
         GLES30.glActiveTexture(GLES30.GL_TEXTURE2)
         GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, subjectMaskTexId)
         GLES30.glUniform1i(GLES30.glGetUniformLocation(liveSepVProgramId, "uSubjectMaskTex"), 2)
         GLES30.glUniform1f(GLES30.glGetUniformLocation(liveSepVProgramId, "uStepY"), stepY)
         drawQuadGeometry()
+        GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
     }
 
     private fun consumeSubjectMaskOnGlThread(
@@ -361,12 +373,14 @@ class CameraLutGlRenderer(
             maskUploadBuffer.put(blended.toInt().coerceIn(0, 255).toByte())
         }
         maskUploadBuffer.position(0)
+        GLES30.glActiveTexture(GLES30.GL_TEXTURE2)
         GLES30.glPixelStorei(GLES30.GL_UNPACK_ALIGNMENT, 1)
         GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, subjectMaskTexId)
         GLES30.glTexSubImage2D(
             GLES30.GL_TEXTURE_2D, 0, 0, 0, MASK_W, MASK_H,
             GLES30.GL_RED, GLES30.GL_UNSIGNED_BYTE, maskUploadBuffer
         )
+        GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
     }
 
     private fun drawQuad(
@@ -426,6 +440,7 @@ class CameraLutGlRenderer(
         GLES30.glUniform1f(uHighlightAlertLoc, if (enableAlert) 1f else 0f)
 
         drawQuadGeometry()
+        GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
     }
 
     private fun drawQuadGeometry() {
@@ -470,7 +485,8 @@ class CameraLutGlRenderer(
         z: Float,
         zCenterX: Float,
         zCenterY: Float,
-        callback: ((FloatArray) -> Unit)?
+        callback: ((FloatArray) -> Unit)?,
+        dispatchSeg: Boolean = true
     ) {
         GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, histFboId)
         GLES30.glViewport(0, 0, MASK_W, MASK_H)
@@ -515,17 +531,16 @@ class CameraLutGlRenderer(
             callback(bins)
         }
 
-        // Dispatch background segmentation + Canon 11-point AF saliency detection
+        // Dispatch background segmentation + Canon 11-point AF saliency detection (~300ms cadence or focus lock)
         val needSeg = bokehStrength > 0.01f
         val needAfDetect = isAutoAfSelection && onAutoAfPointsUpdated != null
-        if ((needSeg || needAfDetect) && segBusy.compareAndSet(false, true)) {
+        if (dispatchSeg && (needSeg || needAfDetect) && segBusy.compareAndSet(false, true)) {
             val rowBytes = MASK_W * 4
             for (y in 0 until MASK_H) {
                 val srcY = MASK_H - 1 - y
                 histPixelBuffer.position(srcY * rowBytes)
-                histPixelBuffer.get(uprightRgba, y * rowBytes, rowBytes)
+                histPixelBuffer.get(workerRgba, y * rowBytes, rowBytes)
             }
-            val frameRgba = uprightRgba.copyOf()
             val fx = focusCenterX
             val fy = focusCenterY
             val diopters = lensFocusDiopters
@@ -537,7 +552,7 @@ class CameraLutGlRenderer(
                     val segmenter = OpticalSubjectSegmenter.getInstance(context)
                     val segResult = if (runSeg) {
                         segmenter.segmentLiveFrame(
-                            uprightRgba = frameRgba,
+                            uprightRgba = workerRgba,
                             width = MASK_W,
                             height = MASK_H,
                             focusNormX = fx,
@@ -558,7 +573,7 @@ class CameraLutGlRenderer(
                         val now = System.currentTimeMillis()
                         if (now - lastAfReportMs >= 280L) {
                             lastAfReportMs = now
-                            val points = segmenter.detectSalientAfPoints(frameRgba, MASK_W, MASK_H, segResult)
+                            val points = segmenter.detectSalientAfPoints(workerRgba, MASK_W, MASK_H, segResult)
                             onAutoAfPointsUpdated?.invoke(points)
                         }
                     }
@@ -585,6 +600,7 @@ class CameraLutGlRenderer(
         for (i in 0..1) {
             val tex = texs[i]
             val fbo = fbos[i]
+            GLES30.glActiveTexture(if (i == 0) GLES30.GL_TEXTURE4 else GLES30.GL_TEXTURE3)
             GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, tex)
             GLES30.glTexImage2D(GLES30.GL_TEXTURE_2D, 0, GLES30.GL_RGBA8, blurW, blurH, 0, GLES30.GL_RGBA, GLES30.GL_UNSIGNED_BYTE, null)
             GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MIN_FILTER, GLES30.GL_LINEAR)
@@ -596,11 +612,13 @@ class CameraLutGlRenderer(
             GLES30.glFramebufferTexture2D(GLES30.GL_FRAMEBUFFER, GLES30.GL_COLOR_ATTACHMENT0, GLES30.GL_TEXTURE_2D, tex, 0)
         }
         GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
+        GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
     }
 
     private fun createSubjectMaskTexture(): Int {
         val ids = IntArray(1)
         GLES30.glGenTextures(1, ids, 0)
+        GLES30.glActiveTexture(GLES30.GL_TEXTURE2)
         GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, ids[0])
         GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MIN_FILTER, GLES30.GL_LINEAR)
         GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MAG_FILTER, GLES30.GL_LINEAR)
@@ -615,6 +633,7 @@ class CameraLutGlRenderer(
             GLES30.GL_TEXTURE_2D, 0, GLES30.GL_R8,
             MASK_W, MASK_H, 0, GLES30.GL_RED, GLES30.GL_UNSIGNED_BYTE, maskUploadBuffer
         )
+        GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
         return ids[0]
     }
 
@@ -626,6 +645,7 @@ class CameraLutGlRenderer(
         histFboId = fboIds[0]
         histTexId = texIds[0]
 
+        GLES30.glActiveTexture(GLES30.GL_TEXTURE4)
         GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, histTexId)
         GLES30.glTexImage2D(
             GLES30.GL_TEXTURE_2D, 0, GLES30.GL_RGBA8,
@@ -640,12 +660,14 @@ class CameraLutGlRenderer(
             GLES30.GL_TEXTURE_2D, histTexId, 0
         )
         GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
+        GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
     }
 
     private fun uploadLutToGpu(style: PictureStyle) {
         val lut = CubeLutParser.loadFromAssets(context, style.cubeAssetPath)
         currentLutSize = lut.size.toFloat()
         val buffer = lut.toRgbaByteBuffer()
+        GLES30.glActiveTexture(GLES30.GL_TEXTURE1)
         GLES30.glBindTexture(GLES30.GL_TEXTURE_3D, lutTextureId)
         GLES30.glTexImage3D(
             GLES30.GL_TEXTURE_3D,
@@ -659,11 +681,13 @@ class CameraLutGlRenderer(
             GLES30.GL_UNSIGNED_BYTE,
             buffer
         )
+        GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
     }
 
     private fun createOesTexture(): Int {
         val ids = IntArray(1)
         GLES30.glGenTextures(1, ids, 0)
+        GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
         GLES30.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, ids[0])
         GLES30.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES30.GL_TEXTURE_MIN_FILTER, GLES30.GL_LINEAR)
         GLES30.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES30.GL_TEXTURE_MAG_FILTER, GLES30.GL_LINEAR)
@@ -675,12 +699,14 @@ class CameraLutGlRenderer(
     private fun create3dLutTexture(): Int {
         val ids = IntArray(1)
         GLES30.glGenTextures(1, ids, 0)
+        GLES30.glActiveTexture(GLES30.GL_TEXTURE1)
         GLES30.glBindTexture(GLES30.GL_TEXTURE_3D, ids[0])
         GLES30.glTexParameteri(GLES30.GL_TEXTURE_3D, GLES30.GL_TEXTURE_MIN_FILTER, GLES30.GL_LINEAR)
         GLES30.glTexParameteri(GLES30.GL_TEXTURE_3D, GLES30.GL_TEXTURE_MAG_FILTER, GLES30.GL_LINEAR)
         GLES30.glTexParameteri(GLES30.GL_TEXTURE_3D, GLES30.GL_TEXTURE_WRAP_S, GLES30.GL_CLAMP_TO_EDGE)
         GLES30.glTexParameteri(GLES30.GL_TEXTURE_3D, GLES30.GL_TEXTURE_WRAP_T, GLES30.GL_CLAMP_TO_EDGE)
         GLES30.glTexParameteri(GLES30.GL_TEXTURE_3D, GLES30.GL_TEXTURE_WRAP_R, GLES30.GL_CLAMP_TO_EDGE)
+        GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
         return ids[0]
     }
 
@@ -767,6 +793,17 @@ class CameraLutGlRenderer(
             }
         """
 
+        private const val PASS_V_VERTEX_SHADER = """#version 300 es
+            layout(location = 0) in vec2 aPosition;
+            layout(location = 1) in vec2 aTexCoord;
+            out vec2 vScreenUv;
+
+            void main() {
+                gl_Position = vec4(aPosition, 0.0, 1.0);
+                vScreenUv = aTexCoord;
+            }
+        """
+
         private const val LIVE_SEP_H_FRAGMENT_SHADER = """#version 300 es
             #extension GL_OES_EGL_image_external_essl3 : require
             precision highp float;
@@ -808,9 +845,9 @@ class CameraLutGlRenderer(
             void main() {
                 vec3 acc = vec3(0.0);
                 float wSum = 0.0;
-                for (int k = -5; k <= 5; k++) {
+                for (int k = -6; k <= 6; k++) {
                     float fk = float(k);
-                    float gW = exp(-0.5 * (fk * fk) / (2.4 * 2.4));
+                    float gW = exp(-0.5 * (fk * fk) / (2.8 * 2.8));
                     vec2 tapUv = clamp(vScreenUv + vec2(fk * uStepX, 0.0), 0.002, 0.998);
                     float subjW = 1.0 - sampleMask(tapUv) * 0.95;
                     float w = gW * max(subjW, 0.05);
@@ -840,9 +877,9 @@ class CameraLutGlRenderer(
             void main() {
                 vec3 acc = vec3(0.0);
                 float wSum = 0.0;
-                for (int k = -5; k <= 5; k++) {
+                for (int k = -6; k <= 6; k++) {
                     float fk = float(k);
-                    float gW = exp(-0.5 * (fk * fk) / (2.4 * 2.4));
+                    float gW = exp(-0.5 * (fk * fk) / (2.8 * 2.8));
                     vec2 tapUv = clamp(vScreenUv + vec2(0.0, fk * uStepY), 0.002, 0.998);
                     float subjW = 1.0 - sampleMask(tapUv) * 0.95;
                     float w = gW * max(subjW, 0.05);
@@ -922,6 +959,8 @@ class CameraLutGlRenderer(
 
                 vec3 rolled = applyHighlightRolloff(raw, uHighlightRolloff);
                 vec3 graded = mix(rolled, sampleLut(rolled), uLutIntensity);
+                graded = clamp((graded - 0.012) / 0.988, 0.0, 1.0);
+                graded = mix(graded, graded * graded * (3.0 - 2.0 * graded), 0.14);
 
                 if (abs(uContrast) > 0.05) {
                     float cFactor = 1.0 + uContrast * 0.08;

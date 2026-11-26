@@ -53,6 +53,8 @@ class DslrViewModel(application: Application) : AndroidViewModel(application) {
     private var isShutterHeldDown: Boolean = false
     @Volatile
     private var hasAutoFiredForCurrentHold: Boolean = false
+    @Volatile
+    private var autoCaptureInProgress: Boolean = false
 
     init {
         viewModelScope.launch {
@@ -109,10 +111,13 @@ class DslrViewModel(application: Application) : AndroidViewModel(application) {
                     }
                     if (isShutterHeldDown && !hasAutoFiredForCurrentHold && !_state.value.isCapturing) {
                         hasAutoFiredForCurrentHold = true
+                        autoCaptureInProgress = true
                         viewModelScope.launch {
-                            delay(75L)
-                            if (isShutterHeldDown && !_state.value.isCapturing && _state.value.isCameraPoweredOn) {
+                            delay(60L)
+                            if (!_state.value.isCapturing && _state.value.isCameraPoweredOn) {
                                 executeShutterCapture(fromHalfPress = true)
+                            } else {
+                                autoCaptureInProgress = false
                             }
                         }
                     }
@@ -338,9 +343,9 @@ class DslrViewModel(application: Application) : AndroidViewModel(application) {
 
     fun onReleaseHalfPress() {
         isShutterHeldDown = false
-        hasAutoFiredForCurrentHold = false
         soundEngine.stopAfHunt()
-        if (!_state.value.isCapturing) {
+        if (!autoCaptureInProgress && !_state.value.isCapturing) {
+            hasAutoFiredForCurrentHold = false
             cameraController.releaseHalfPress()
             _state.update { it.copy(isHalfPressedAfLocked = false, isAfHunting = false, isSubjectFocused = false) }
         }
@@ -371,6 +376,7 @@ class DslrViewModel(application: Application) : AndroidViewModel(application) {
 
         captureJob?.cancel()
         captureJob = viewModelScope.launch {
+            autoCaptureInProgress = false
             val delaySec = when (current.driveMode) {
                 DriveMode.TIMER_2S -> 2
                 DriveMode.TIMER_10S -> 10
@@ -386,13 +392,23 @@ class DslrViewModel(application: Application) : AndroidViewModel(application) {
             val latestBeforeShot = _state.value
             if (fromHalfPress) {
                 if (latestBeforeShot.isAfHunting && !latestBeforeShot.isHalfPressedAfLocked && !latestBeforeShot.isSubjectFocused) {
-                    cameraController.acquireFocusForShutter(latestBeforeShot)
+                    val locked = cameraController.acquireFocusForShutter(latestBeforeShot)
                     soundEngine.stopAfHunt()
+                    if (!locked && latestBeforeShot.afMode == AfMode.ONE_SHOT) {
+                        hasAutoFiredForCurrentHold = false
+                        showBanner("AF NOT LOCKED")
+                        return@launch
+                    }
                 }
             } else {
                 if (!latestBeforeShot.isSubjectFocused || !latestBeforeShot.isHalfPressedAfLocked) {
-                    cameraController.acquireFocusForShutter(latestBeforeShot)
+                    val locked = cameraController.acquireFocusForShutter(latestBeforeShot)
                     soundEngine.stopAfHunt()
+                    if (!locked && latestBeforeShot.afMode == AfMode.ONE_SHOT) {
+                        hasAutoFiredForCurrentHold = false
+                        showBanner("AF NOT LOCKED")
+                        return@launch
+                    }
                 }
             }
 
