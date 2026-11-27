@@ -427,16 +427,29 @@ fun Dslr6dCameraScreen(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Text(
-                            text = if (state.opticalBokehEnabled) "BOKEH" else "STD",
+                            text = if (state.opticalBokehEnabled && state.bokehUserMultiplier > 0.02f) "BOKEH" else "STD",
                             fontSize = 7.5.sp,
                             fontFamily = FontFamily.Monospace,
                             fontWeight = FontWeight.Bold,
-                            color = if (state.opticalBokehEnabled) DslrColors.VfEmeraldText else DslrColors.LegendMuted,
+                            color = if (state.opticalBokehEnabled && state.bokehUserMultiplier > 0.02f) DslrColors.VfEmeraldText else DslrColors.LegendMuted,
                             modifier = Modifier
                                 .clip(RoundedCornerShape(6.dp))
                                 .background(Color(0xFF0C0D11))
-                                .border(0.8.dp, DslrColors.ChassisHairline, RoundedCornerShape(6.dp))
-                                .clickable { onUpdateState { it.copy(opticalBokehEnabled = !it.opticalBokehEnabled) } }
+                                .border(
+                                    width = if (state.isBokehSliderOpen) 1.1.dp else 0.8.dp,
+                                    color = if (state.isBokehSliderOpen) DslrColors.MangoGold else DslrColors.ChassisHairline,
+                                    shape = RoundedCornerShape(6.dp)
+                                )
+                                .clickable {
+                                    onUpdateState {
+                                        it.copy(
+                                            isBokehSliderOpen = !it.isBokehSliderOpen,
+                                            isMenuOpen = false,
+                                            isQMenuOpen = false,
+                                            isPlaybackOpen = false
+                                        )
+                                    }
+                                }
                                 .padding(horizontal = 6.dp, vertical = 2.5.dp)
                         )
                         CardAccessLamp(pendingCount = state.pendingSaveCount)

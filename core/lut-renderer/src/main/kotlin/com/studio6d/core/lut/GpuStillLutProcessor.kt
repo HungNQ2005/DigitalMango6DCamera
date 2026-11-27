@@ -346,17 +346,19 @@ object GpuStillLutProcessor {
         colorToneOffset: Int
     ): Bitmap {
         ensureGlInitialized()
+        val tRenderStart = System.currentTimeMillis()
+        val maxRenderDim = min(maxTexSize, 3600)
 
         var outW = requestedOutW
         var outH = requestedOutH
-        if (outW > maxTexSize || outH > maxTexSize) {
-            val scale = min(maxTexSize.toFloat() / outW, maxTexSize.toFloat() / outH)
+        if (outW > maxRenderDim || outH > maxRenderDim) {
+            val scale = min(maxRenderDim.toFloat() / outW, maxRenderDim.toFloat() / outH)
             outW = (outW * scale).roundToInt().coerceAtLeast(2)
             outH = (outH * scale).roundToInt().coerceAtLeast(2)
         }
 
-        val uploadBitmap = if (source.width > maxTexSize || source.height > maxTexSize) {
-            val scale = min(maxTexSize.toFloat() / source.width, maxTexSize.toFloat() / source.height)
+        val uploadBitmap = if (source.width > maxRenderDim || source.height > maxRenderDim) {
+            val scale = min(maxRenderDim.toFloat() / source.width, maxRenderDim.toFloat() / source.height)
             Bitmap.createScaledBitmap(
                 source,
                 (source.width * scale).roundToInt().coerceAtLeast(2),
@@ -383,9 +385,10 @@ object GpuStillLutProcessor {
         val hasValidDepth = hasValidMask &&
             depthBytes != null &&
             depthBytes.size >= subjectMask.width * subjectMask.height
+        val hasMatte = hasValidMask && subjectMask.hasSilhouetteMatte
 
         val distanceBoost = (0.80f + 0.45f * (lensDiopters.coerceIn(0.35f, 3.2f) / 2.0f)).coerceIn(0.80f, 1.55f)
-        val effectiveBokeh = if (hasValidMask) (bokehStrength * distanceBoost).coerceIn(0f, 1.15f) else 0f
+        val effectiveBokeh = if (hasValidMask) (bokehStrength * distanceBoost).coerceIn(0f, 1.25f) else 0f
 
         if (hasValidMask) {
             val maskBuf = ByteBuffer.allocateDirect(subjectMask.maskBytes.size)
@@ -412,7 +415,7 @@ object GpuStillLutProcessor {
                 )
             }
 
-            // PASS 1A & 1B: 17x17 Foreground-Excluded Separable Gaussian Background at 1/4 Res
+            // PASS 1A & 1B: Subject-Excluded Clean Anti-Aliasing Prefilter at 1/4 Res (bgFboA / bgFboB)
             val reqHalfW = (outW / 4).coerceAtLeast(240)
             val reqHalfH = (outH / 4).coerceAtLeast(160)
             val dimsA = ensureFboSize(bgFboA, bgTexA, halfW, halfH, reqHalfW, reqHalfH, "bgFboA")
@@ -420,10 +423,10 @@ object GpuStillLutProcessor {
             halfW = dimsA.first
             halfH = dimsB.second
 
-            val stepY = 0.0046f * effectiveBokeh
+            val stepY = 0.0022f * effectiveBokeh
             val stepX = stepY / 1.5f
 
-            // Pass 1A: Horizontal blur from uSrcTex -> bgFboA
+            // Pass 1A: Horizontal prefilter uSrcTex -> bgFboA
             GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, bgFboA)
             GLES30.glViewport(0, 0, halfW, halfH)
             GLES30.glUseProgram(sepProgramId)
@@ -442,11 +445,12 @@ object GpuStillLutProcessor {
             GLES30.glUniform1i(GLES30.glGetUniformLocation(sepProgramId, "uIsSrcPass"), 1)
             GLES30.glUniform1f(GLES30.glGetUniformLocation(sepProgramId, "uHasSubject"), 1f)
             GLES30.glUniform1f(GLES30.glGetUniformLocation(sepProgramId, "uHasDepth"), if (hasValidDepth) 1f else 0f)
+            GLES30.glUniform1f(GLES30.glGetUniformLocation(sepProgramId, "uHasMatte"), if (hasMatte) 1f else 0f)
             GLES30.glUniform1f(GLES30.glGetUniformLocation(sepProgramId, "uFocusDepth"), subjectMask.focusDepth)
             GLES30.glUniform1f(GLES30.glGetUniformLocation(sepProgramId, "uDofHalfWidth"), subjectMask.dofHalfWidth)
             drawBoundQuad()
 
-            // Pass 1B: Vertical blur from bgTexA -> bgFboB
+            // Pass 1B: Vertical prefilter bgTexA -> bgFboB
             GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, bgFboB)
             GLES30.glViewport(0, 0, halfW, halfH)
             GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
@@ -456,9 +460,9 @@ object GpuStillLutProcessor {
             GLES30.glUniform1i(GLES30.glGetUniformLocation(sepProgramId, "uIsSrcPass"), 0)
             drawBoundQuad()
 
-            // PASS 1C: 32-tap Full-Frame Optical Disc + Subtle Specular Bloom on bgTexB -> bgFboDeep (1/6 Res)
-            val reqDeepW = (outW / 6).coerceAtLeast(180)
-            val reqDeepH = (outH / 6).coerceAtLeast(120)
+            // PASS 1C: Per-Pixel Variable-Radius 48-Tap Linear HDR Optical Aperture Disc at 1/2 Res -> bgFboDeep
+            val reqDeepW = (outW / 2).coerceAtLeast(480)
+            val reqDeepH = (outH / 2).coerceAtLeast(320)
             val dimsDeep = ensureFboSize(bgFboDeep, bgTexDeep, deepW, deepH, reqDeepW, reqDeepH, "bgFboDeep")
             deepW = dimsDeep.first
             deepH = dimsDeep.second
@@ -467,22 +471,29 @@ object GpuStillLutProcessor {
             GLES30.glViewport(0, 0, deepW, deepH)
             GLES30.glUseProgram(discProgramId)
             GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
-            GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, bgTexB)
-            GLES30.glUniform1i(GLES30.glGetUniformLocation(discProgramId, "uBgTexB"), 0)
+            GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, srcTexId)
+            GLES30.glUniform1i(GLES30.glGetUniformLocation(discProgramId, "uSrcTex"), 0)
             GLES30.glActiveTexture(GLES30.GL_TEXTURE2)
             GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, maskTexId)
             GLES30.glUniform1i(GLES30.glGetUniformLocation(discProgramId, "uSubjectMaskTex"), 2)
+            GLES30.glActiveTexture(GLES30.GL_TEXTURE3)
+            GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, bgTexB)
+            GLES30.glUniform1i(GLES30.glGetUniformLocation(discProgramId, "uBgTexB"), 3)
             GLES30.glActiveTexture(GLES30.GL_TEXTURE5)
             GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, depthTexId)
             GLES30.glUniform1i(GLES30.glGetUniformLocation(discProgramId, "uDepthTex"), 5)
+            GLES30.glUniform1i(GLES30.glGetUniformLocation(discProgramId, "uRotationMode"), rotMode)
+            GLES30.glUniform2f(GLES30.glGetUniformLocation(discProgramId, "uCropScale"), cropScaleX, cropScaleY)
             GLES30.glUniform1f(GLES30.glGetUniformLocation(discProgramId, "uBokehStrength"), effectiveBokeh)
             GLES30.glUniform1f(GLES30.glGetUniformLocation(discProgramId, "uHasDepth"), if (hasValidDepth) 1f else 0f)
+            GLES30.glUniform1f(GLES30.glGetUniformLocation(discProgramId, "uHasMatte"), if (hasMatte) 1f else 0f)
             GLES30.glUniform1f(GLES30.glGetUniformLocation(discProgramId, "uFocusDepth"), subjectMask.focusDepth)
             GLES30.glUniform1f(GLES30.glGetUniformLocation(discProgramId, "uDofHalfWidth"), subjectMask.dofHalfWidth)
+            GLES30.glUniform1f(GLES30.glGetUniformLocation(discProgramId, "uDofFalloff"), subjectMask.dofFalloff)
             drawBoundQuad()
         }
 
-        // PASS 2: Full-resolution subject sharpness + prime-lens micro-clarity + 2-stage smooth DoF + 3D LUT
+        // PASS 2: Full-resolution sub-pixel alpha matte composite + foreground defocus + 3D LUT
         val (lutTexId, lutSize) = getOrUploadLutTexture(context, style)
         val dimsOut = ensureFboSize(fboId, fboTexId, fboW, fboH, outW, outH, "finalFbo")
         fboW = dimsOut.first
@@ -527,6 +538,7 @@ object GpuStillLutProcessor {
         GLES30.glUniform1f(GLES30.glGetUniformLocation(programId, "uBokehStrength"), effectiveBokeh)
         GLES30.glUniform1f(GLES30.glGetUniformLocation(programId, "uHasSubject"), if (hasValidMask) 1f else 0f)
         GLES30.glUniform1f(GLES30.glGetUniformLocation(programId, "uHasDepth"), if (hasValidDepth) 1f else 0f)
+        GLES30.glUniform1f(GLES30.glGetUniformLocation(programId, "uHasMatte"), if (hasMatte) 1f else 0f)
         GLES30.glUniform1f(GLES30.glGetUniformLocation(programId, "uFocusDepth"), subjectMask.focusDepth)
         GLES30.glUniform1f(GLES30.glGetUniformLocation(programId, "uDofHalfWidth"), subjectMask.dofHalfWidth)
         GLES30.glUniform1f(GLES30.glGetUniformLocation(programId, "uDofFalloff"), subjectMask.dofFalloff)
@@ -550,6 +562,7 @@ object GpuStillLutProcessor {
 
         val outBitmap = Bitmap.createBitmap(outW, outH, Bitmap.Config.ARGB_8888)
         outBitmap.copyPixelsFromBuffer(outBuffer)
+        Log.i(TAG, "GPU still render ${outW}x${outH} in ${System.currentTimeMillis() - tRenderStart}ms (bokeh=${effectiveBokeh}, matte=$hasMatte, depth=$hasValidDepth)")
         return outBitmap
     }
 
@@ -660,6 +673,7 @@ object GpuStillLutProcessor {
         uniform int uIsSrcPass;
         uniform float uHasSubject;
         uniform float uHasDepth;
+        uniform float uHasMatte;
         uniform float uFocusDepth;
         uniform float uDofHalfWidth;
 
@@ -682,17 +696,20 @@ object GpuStillLutProcessor {
             float wSum = 0.0;
             for (int k = -8; k <= 8; k++) {
                 float fk = float(k);
-                float gWeight = exp(-0.5 * (fk * fk) / (3.4 * 3.4));
+                float gWeight = exp(-0.5 * (fk * fk) / (3.2 * 3.2));
                 vec2 tapUv = clamp(vScreenUv + uBlurStep * fk, 0.001, 0.999);
-                float bgWeight;
+                float bgWeight = 1.0;
+                if (uHasMatte > 0.5) {
+                    bgWeight *= smoothstep(0.65, 0.08, texture(uSubjectMaskTex, tapUv).r);
+                }
                 if (uHasDepth > 0.5) {
                     float tapD = texture(uDepthTex, tapUv).r;
-                    bgWeight = max(smoothstep(uFocusDepth - uDofHalfWidth * 0.45, uFocusDepth - uDofHalfWidth - 0.08, tapD), 0.015);
-                } else {
-                    float subjW = (uHasSubject > 0.5) ? (1.0 - texture(uSubjectMaskTex, tapUv).r * 0.96) : 1.0;
-                    bgWeight = max(subjW, 0.04);
+                    bgWeight *= smoothstep(uFocusDepth - uDofHalfWidth * 0.25, uFocusDepth - uDofHalfWidth - 0.07, tapD);
                 }
-                float w = gWeight * bgWeight;
+                if (uHasMatte <= 0.5 && uHasDepth <= 0.5 && uHasSubject > 0.5) {
+                    bgWeight = 1.0 - texture(uSubjectMaskTex, tapUv).r * 0.96;
+                }
+                float w = gWeight * max(bgWeight, 0.002);
                 vec2 sampleUv = (uIsSrcPass == 1) ? clamp(screenToTexUv(tapUv), 0.001, 0.999) : tapUv;
                 acc += texture(uInputTex, sampleUv).rgb * w;
                 wSum += w;
@@ -713,55 +730,117 @@ object GpuStillLutProcessor {
         in vec2 vTexCoord;
         in vec2 vScreenUv;
 
-        uniform sampler2D uBgTexB;
+        uniform sampler2D uSrcTex;
         uniform sampler2D uSubjectMaskTex;
+        uniform sampler2D uBgTexB;
         uniform sampler2D uDepthTex;
+        uniform int uRotationMode;
+        uniform vec2 uCropScale;
         uniform float uBokehStrength;
         uniform float uHasDepth;
+        uniform float uHasMatte;
         uniform float uFocusDepth;
         uniform float uDofHalfWidth;
+        uniform float uDofFalloff;
 
         out vec4 fragColor;
+
+        vec2 screenToTexUv(vec2 suv) {
+            vec2 cropped = (suv - 0.5) * uCropScale + 0.5;
+            if (uRotationMode == 1) {
+                return vec2(cropped.y, 1.0 - cropped.x);
+            } else if (uRotationMode == 2) {
+                return vec2(1.0 - cropped.x, 1.0 - cropped.y);
+            } else if (uRotationMode == 3) {
+                return vec2(1.0 - cropped.y, cropped.x);
+            }
+            return cropped;
+        }
 
         float luminance(vec3 c) {
             return dot(c, vec3(0.2126, 0.7152, 0.0722));
         }
 
         void main() {
-            vec3 center = texture(uBgTexB, vScreenUv).rgb;
-            float radius = 0.026 * uBokehStrength;
-            if (radius <= 0.0004) {
-                fragColor = vec4(center, 1.0);
+            vec3 srcCenter = texture(uSrcTex, clamp(vTexCoord, 0.001, 0.999)).rgb;
+            float centerMatte = (uHasMatte > 0.5) ? texture(uSubjectMaskTex, vScreenUv).r : 0.0;
+            if (centerMatte > 0.985) {
+                fragColor = vec4(srcCenter, 1.0);
                 return;
             }
 
-            vec3 acc = center * 0.12;
-            float wSum = 0.12;
+            float bgCoC = 1.0;
+            if (uHasDepth > 0.5) {
+                float centerD = texture(uDepthTex, vScreenUv).r;
+                float bgD = centerD;
+                if (centerMatte > 0.03) {
+                    float offX = 0.008 / 1.5;
+                    float offY = 0.008;
+                    bgD = min(bgD, texture(uDepthTex, clamp(vScreenUv + vec2(offX, 0.0), 0.002, 0.998)).r);
+                    bgD = min(bgD, texture(uDepthTex, clamp(vScreenUv - vec2(offX, 0.0), 0.002, 0.998)).r);
+                    bgD = min(bgD, texture(uDepthTex, clamp(vScreenUv + vec2(0.0, offY), 0.002, 0.998)).r);
+                    bgD = min(bgD, texture(uDepthTex, clamp(vScreenUv - vec2(0.0, offY), 0.002, 0.998)).r);
+                }
+                float behind = max(0.0, uFocusDepth - bgD);
+                float depthCoC = smoothstep(uDofHalfWidth * 0.55, uDofHalfWidth * 0.55 + uDofFalloff, behind);
+                if (uHasMatte > 0.5) {
+                    float isCloserFg = smoothstep(uDofHalfWidth * 0.45, uDofHalfWidth * 0.95, bgD - uFocusDepth);
+                    float groundContact = smoothstep(0.68, 0.96, vScreenUv.y) * (1.0 - smoothstep(0.0, uDofHalfWidth * 0.85, abs(bgD - uFocusDepth)));
+                    float matteFloor = 0.44 * (1.0 - centerMatte) * (1.0 - isCloserFg) * (1.0 - 0.65 * groundContact);
+                    bgCoC = clamp(max(depthCoC, matteFloor), 0.0, 1.0);
+                } else {
+                    bgCoC = smoothstep(uDofHalfWidth, uDofHalfWidth + uDofFalloff, behind);
+                }
+            }
+
+            float radius = 0.028 * uBokehStrength * bgCoC;
+            if (radius <= 0.00035) {
+                fragColor = vec4(srcCenter, 1.0);
+                return;
+            }
+
+            float usePrefilter = smoothstep(0.004, 0.012, radius);
+            vec3 accLin = vec3(0.0);
+            float wSum = 0.0;
             const float goldenAngle = 2.39996323;
             const float invAspect = 1.0 / 1.5;
 
-            for (int i = 0; i < 32; i++) {
+            for (int i = 0; i < 48; i++) {
                 float fi = float(i);
-                float r = sqrt((fi + 0.5) / 32.0) * radius;
+                float rNorm = sqrt((fi + 0.5) / 48.0);
+                float r = rNorm * radius;
                 float a = fi * goldenAngle;
-                vec2 off = vec2(cos(a) * r * invAspect, sin(a) * r);
-                vec2 tapUv = clamp(vScreenUv + off, 0.002, 0.998);
-                float bgOnly;
-                if (uHasDepth > 0.5) {
+                vec2 tapUv = clamp(vScreenUv + vec2(cos(a) * r * invAspect, sin(a) * r), 0.002, 0.998);
+
+                float occ = 1.0;
+                if (uHasMatte > 0.5) {
+                    occ *= smoothstep(0.62, 0.06, texture(uSubjectMaskTex, tapUv).r);
+                    if (uHasDepth > 0.5) {
+                        float tapD = texture(uDepthTex, tapUv).r;
+                        occ *= smoothstep(uFocusDepth + uDofHalfWidth * 0.80, uFocusDepth + uDofHalfWidth * 0.20, tapD);
+                    }
+                } else if (uHasDepth > 0.5) {
                     float tapD = texture(uDepthTex, tapUv).r;
-                    bgOnly = smoothstep(uFocusDepth - uDofHalfWidth * 0.40, uFocusDepth - uDofHalfWidth - 0.10, tapD) * 0.985 + 0.015;
-                } else {
-                    float tapSubj = texture(uSubjectMaskTex, tapUv).r;
-                    bgOnly = smoothstep(0.85, 0.15, tapSubj) * 0.97 + 0.03;
+                    occ *= smoothstep(uFocusDepth - uDofHalfWidth * 0.20, uFocusDepth - uDofHalfWidth - 0.07, tapD);
                 }
 
-                vec3 s = texture(uBgTexB, tapUv).rgb;
-                float specBloom = 1.0 + smoothstep(0.76, 1.0, luminance(s)) * 1.45 * uBokehStrength * bgOnly;
-                float w = bgOnly * specBloom;
-                acc += s * w;
+                vec3 srcS = texture(uSrcTex, clamp(screenToTexUv(tapUv), 0.001, 0.999)).rgb;
+                vec3 preS = texture(uBgTexB, tapUv).rgb;
+                vec3 s = mix(srcS, preS, usePrefilter);
+
+                float rimBoost = 0.88 + 0.22 * smoothstep(0.65, 0.98, rNorm);
+                float lum = luminance(s);
+                float hdrEnergy = 1.0 + smoothstep(0.48, 0.99, lum) * (4.2 * uBokehStrength) * bgCoC;
+                float w = max(occ, 0.004) * rimBoost * hdrEnergy;
+
+                vec3 lin = pow(max(s, vec3(0.0)), vec3(2.2));
+                accLin += lin * w;
                 wSum += w;
             }
-            fragColor = vec4(acc / max(wSum, 0.001), 1.0);
+
+            vec3 avgLin = accLin / max(wSum, 0.0001);
+            vec3 toneMapped = avgLin / (1.0 + max(vec3(0.0), avgLin - 0.68) * 0.36);
+            fragColor = vec4(pow(clamp(toneMapped, 0.0, 1.0), vec3(1.0 / 2.2)), 1.0);
         }
     """
 
@@ -791,6 +870,7 @@ object GpuStillLutProcessor {
         uniform float uBokehStrength;
         uniform float uHasSubject;
         uniform float uHasDepth;
+        uniform float uHasMatte;
         uniform float uFocusDepth;
         uniform float uDofHalfWidth;
         uniform float uDofFalloff;
@@ -834,12 +914,27 @@ object GpuStillLutProcessor {
             return texture(uLutTex, coord).rgb;
         }
 
+        vec3 applyCanonAloClarity(vec3 col) {
+            float lum = luminance(col);
+            float shadowToe = smoothstep(0.0, 0.032, lum);
+            float aloMask = shadowToe * (1.0 - smoothstep(0.50, 0.92, lum));
+            vec3 lifted = pow(max(col, vec3(0.0)), vec3(0.84));
+            vec3 c = mix(col, lifted, 0.44 * aloMask);
+            c = clamp((c - 0.42) * 1.065 + 0.435, 0.0, 1.0);
+            c.r = clamp(c.r * 1.014, 0.0, 1.0);
+            c.b = clamp(c.b * 1.006, 0.0, 1.0);
+            float l2 = luminance(c);
+            float sat = max(c.r, max(c.g, c.b)) - min(c.r, min(c.g, c.b));
+            float vib = (1.0 - smoothstep(0.32, 0.82, sat)) * 0.16;
+            return clamp(mix(vec3(l2), c, 1.0 + vib), 0.0, 1.0);
+        }
+
         float sampleRefinedSubjectMask(vec3 centerCol) {
             float mCenter = texture(uSubjectMaskTex, vScreenUv).r;
             float wSum = 1.0;
             float mSum = mCenter;
-            float dx = 0.004 / 1.5;
-            float dy = 0.004;
+            float dx = 0.0018 / 1.5;
+            float dy = 0.0018;
             for (int i = 0; i < 4; i++) {
                 vec2 off = (i == 0) ? vec2(dx, 0.0) :
                            (i == 1) ? vec2(-dx, 0.0) :
@@ -847,7 +942,7 @@ object GpuStillLutProcessor {
                 vec2 nUv = clamp(vScreenUv + off, 0.001, 0.999);
                 vec3 nCol = texture(uSrcTex, clamp(screenToTexUv(nUv), 0.001, 0.999)).rgb;
                 vec3 diff = nCol - centerCol;
-                float w = exp(-dot(diff, diff) * 45.0) * 0.7;
+                float w = exp(-dot(diff, diff) * 75.0) * 0.75;
                 mSum += texture(uSubjectMaskTex, nUv).r * w;
                 wSum += w;
             }
@@ -858,8 +953,8 @@ object GpuStillLutProcessor {
             float dCenter = texture(uDepthTex, vScreenUv).r;
             float wSum = 1.0;
             float dSum = dCenter;
-            float dx = 0.0025 / 1.5;
-            float dy = 0.0025;
+            float dx = 0.0022 / 1.5;
+            float dy = 0.0022;
             for (int i = 0; i < 4; i++) {
                 vec2 off = (i == 0) ? vec2(dx, 0.0) :
                            (i == 1) ? vec2(-dx, 0.0) :
@@ -867,7 +962,7 @@ object GpuStillLutProcessor {
                 vec2 nUv = clamp(vScreenUv + off, 0.001, 0.999);
                 vec3 nCol = texture(uSrcTex, clamp(screenToTexUv(nUv), 0.001, 0.999)).rgb;
                 vec3 diff = nCol - centerCol;
-                float w = exp(-dot(diff, diff) * 65.0) * 0.75;
+                float w = exp(-dot(diff, diff) * 70.0) * 0.75;
                 dSum += texture(uDepthTex, nUv).r * w;
                 wSum += w;
             }
@@ -876,24 +971,24 @@ object GpuStillLutProcessor {
 
         vec3 sampleForegroundDisc(vec2 suv, float fgCoC, float bokehStr) {
             vec3 center = texture(uSrcTex, clamp(screenToTexUv(suv), 0.001, 0.999)).rgb;
-            float radius = 0.014 * bokehStr * fgCoC;
+            float radius = 0.016 * bokehStr * fgCoC;
             if (radius <= 0.0003) return center;
-            vec3 acc = center * 0.14;
-            float wSum = 0.14;
+            vec3 accLin = pow(max(center, vec3(0.0)), vec3(2.2)) * 0.12;
+            float wSum = 0.12;
             const float goldenAngle = 2.39996323;
             const float invAspect = 1.0 / 1.5;
-            for (int i = 0; i < 12; i++) {
+            for (int i = 0; i < 16; i++) {
                 float fi = float(i);
-                float r = sqrt((fi + 0.5) / 12.0) * radius;
+                float r = sqrt((fi + 0.5) / 16.0) * radius;
                 float a = fi * goldenAngle;
                 vec2 tapUv = clamp(suv + vec2(cos(a) * r * invAspect, sin(a) * r), 0.001, 0.999);
                 float tapD = texture(uDepthTex, tapUv).r;
                 float fgOnly = smoothstep(uFocusDepth + uDofHalfWidth * 0.30, uFocusDepth + uDofHalfWidth + 0.06, tapD) * 0.95 + 0.05;
                 vec3 s = texture(uSrcTex, clamp(screenToTexUv(tapUv), 0.001, 0.999)).rgb;
-                acc += s * fgOnly;
+                accLin += pow(max(s, vec3(0.0)), vec3(2.2)) * fgOnly;
                 wSum += fgOnly;
             }
-            return acc / max(wSum, 0.001);
+            return pow(clamp(accLin / max(wSum, 0.001), 0.0, 1.0), vec3(1.0 / 2.2));
         }
 
         vec3 applyPrimeMicroClarity(vec3 centerCol, float clarityWeight) {
@@ -911,65 +1006,60 @@ object GpuStillLutProcessor {
             vec3 raw;
 
             if (uHasSubject > 0.5 && uBokehStrength > 0.01) {
-                if (uHasDepth > 0.5) {
+                vec3 crispSubj = applyPrimeMicroClarity(centerRaw, 1.0);
+                vec3 bokehBg = texture(uBgTexDeep, vScreenUv).rgb;
+
+                if (uHasMatte > 0.5) {
+                    float matte = sampleRefinedSubjectMask(centerRaw);
+                    if (uHasDepth > 0.5) {
+                        float d = sampleRefinedDepth(centerRaw);
+                        float fgCoC = smoothstep(uDofHalfWidth * 0.72, uDofHalfWidth * 0.72 + uDofFalloff, d - uFocusDepth);
+                        if (matte < 0.20 && fgCoC > 0.02) {
+                            vec3 fgBlur = sampleForegroundDisc(vScreenUv, fgCoC, uBokehStrength);
+                            vec3 bgOrFg = mix(bokehBg, fgBlur, smoothstep(0.02, 0.25, fgCoC));
+                            raw = mix(bgOrFg, crispSubj, matte);
+                        } else if (matte >= 0.99) {
+                            raw = crispSubj;
+                        } else if (matte > 0.01) {
+                            raw = mix(bokehBg, crispSubj, matte);
+                        } else {
+                            float depthCoC = smoothstep(uDofHalfWidth * 0.55, uDofHalfWidth * 0.55 + uDofFalloff, uFocusDepth - d);
+                            float isCloserFg = smoothstep(uDofHalfWidth * 0.45, uDofHalfWidth * 0.95, d - uFocusDepth);
+                            float groundContact = smoothstep(0.68, 0.96, vScreenUv.y) * (1.0 - smoothstep(0.0, uDofHalfWidth * 0.85, abs(d - uFocusDepth)));
+                            float matteFloor = 0.44 * (1.0 - isCloserFg) * (1.0 - 0.65 * groundContact);
+                            float bgCoC = clamp(max(depthCoC, matteFloor), 0.0, 1.0);
+                            raw = (bgCoC < 0.002) ? crispSubj : mix(crispSubj, bokehBg, smoothstep(0.0, 0.12, bgCoC));
+                        }
+                    } else {
+                        raw = mix(bokehBg, crispSubj, matte);
+                    }
+                } else if (uHasDepth > 0.5) {
                     float d = sampleRefinedDepth(centerRaw);
                     float behind = uFocusDepth - d;
                     float inFront = d - uFocusDepth;
                     float bgCoC = smoothstep(uDofHalfWidth, uDofHalfWidth + uDofFalloff, behind);
                     float fgCoC = smoothstep(uDofHalfWidth * 1.10, uDofHalfWidth * 1.10 + uDofFalloff * 1.15, inFront);
 
-                    if (bgCoC < 0.005 && fgCoC < 0.005) {
-                        raw = applyPrimeMicroClarity(centerRaw, 1.0);
+                    if (bgCoC < 0.002 && fgCoC < 0.002) {
+                        raw = crispSubj;
                     } else if (fgCoC >= bgCoC) {
                         vec3 sharp = applyPrimeMicroClarity(centerRaw, 1.0 - fgCoC);
                         vec3 fgBlur = sampleForegroundDisc(vScreenUv, fgCoC, uBokehStrength);
                         raw = mix(sharp, fgBlur, smoothstep(0.0, 1.0, fgCoC));
                     } else {
                         vec3 sharp = applyPrimeMicroClarity(centerRaw, 1.0 - bgCoC);
-                        vec3 medBg = texture(uBgTexB, vScreenUv).rgb;
-                        vec3 deepBg = texture(uBgTexDeep, vScreenUv).rgb;
-                        if (bgCoC < 0.34) {
-                            float t = clamp(bgCoC / 0.34, 0.0, 1.0);
-                            raw = mix(sharp, medBg, t);
-                        } else {
-                            float t = (bgCoC - 0.34) / 0.66;
-                            raw = mix(medBg, deepBg, t);
-                        }
+                        raw = mix(sharp, bokehBg, smoothstep(0.0, 0.08, bgCoC));
                     }
                 } else {
                     float subj = sampleRefinedSubjectMask(centerRaw);
-                    vec3 crispSubj = applyPrimeMicroClarity(centerRaw, subj);
-                    float blurMask = smoothstep(0.14, 0.82, 1.0 - subj);
-
-                    if (blurMask < 0.005) {
-                        raw = crispSubj;
-                    } else {
-                        vec3 medBg = texture(uBgTexB, vScreenUv).rgb;
-                        vec3 deepBg = texture(uBgTexDeep, vScreenUv).rgb;
-                        if (blurMask < 0.45) {
-                            float t = smoothstep(0.0, 1.0, blurMask / 0.45);
-                            raw = mix(crispSubj, medBg, t);
-                        } else {
-                            float t = (blurMask - 0.45) / 0.55;
-                            raw = mix(medBg, deepBg, t);
-                        }
-                    }
+                    raw = mix(bokehBg, applyPrimeMicroClarity(centerRaw, subj), subj);
                 }
             } else {
                 raw = applyPrimeMicroClarity(centerRaw, 0.70);
             }
 
             vec3 rolled = applyHighlightRolloff(raw, uHighlightRolloff);
-            vec3 graded = mix(rolled, sampleLut(rolled), uLutIntensity);
-            graded = clamp((graded - 0.012) / 0.988, 0.0, 1.0);
-            vec3 sCurve = graded * graded * (3.0 - 2.0 * graded);
-            graded = mix(graded, sCurve, 0.16);
-            float lumG = luminance(graded);
-            float maxC = max(graded.r, max(graded.g, graded.b));
-            float minC = min(graded.r, min(graded.g, graded.b));
-            float satG = maxC - minC;
-            float vibWeight = (1.0 - smoothstep(0.35, 0.85, satG)) * 0.14;
-            graded = clamp(mix(vec3(lumG), graded, 1.0 + vibWeight), 0.0, 1.0);
+            vec3 graded = applyCanonAloClarity(mix(rolled, sampleLut(rolled), uLutIntensity));
 
             if (abs(uContrast) > 0.05) {
                 float cFactor = 1.0 + uContrast * 0.08;

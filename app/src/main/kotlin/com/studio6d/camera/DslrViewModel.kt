@@ -325,7 +325,8 @@ class DslrViewModel(application: Application) : AndroidViewModel(application) {
                 isAfHunting = true,
                 isMenuOpen = false,
                 isQMenuOpen = false,
-                isPlaybackOpen = false
+                isPlaybackOpen = false,
+                isBokehSliderOpen = false
             )
         }
         cameraController.triggerHalfPressAfAe(_state.value)
@@ -349,7 +350,8 @@ class DslrViewModel(application: Application) : AndroidViewModel(application) {
                     isAfHunting = true,
                     isMenuOpen = false,
                     isQMenuOpen = false,
-                    isPlaybackOpen = false
+                    isPlaybackOpen = false,
+                    isBokehSliderOpen = false
                 )
             }
             cameraController.triggerHalfPressAfAe(_state.value)
@@ -419,7 +421,7 @@ class DslrViewModel(application: Application) : AndroidViewModel(application) {
                 if (latestBeforeShot.isAfHunting && !latestBeforeShot.isHalfPressedAfLocked && !latestBeforeShot.isSubjectFocused) {
                     val locked = cameraController.acquireFocusForShutter(latestBeforeShot)
                     soundEngine.stopAfHunt()
-                    if (!locked && latestBeforeShot.afMode == AfMode.ONE_SHOT) {
+                    if (!locked && (latestBeforeShot.afMode == AfMode.ONE_SHOT || latestBeforeShot.afMode == AfMode.AI_FOCUS)) {
                         hasAutoFiredForCurrentHold = false
                         showBanner("AF NOT LOCKED")
                         return@launch
@@ -429,10 +431,23 @@ class DslrViewModel(application: Application) : AndroidViewModel(application) {
                 if (!latestBeforeShot.isSubjectFocused || !latestBeforeShot.isHalfPressedAfLocked) {
                     val locked = cameraController.acquireFocusForShutter(latestBeforeShot)
                     soundEngine.stopAfHunt()
-                    if (!locked && latestBeforeShot.afMode == AfMode.ONE_SHOT) {
+                    if (!locked && (latestBeforeShot.afMode == AfMode.ONE_SHOT || latestBeforeShot.afMode == AfMode.AI_FOCUS)) {
                         hasAutoFiredForCurrentHold = false
                         showBanner("AF NOT LOCKED")
                         return@launch
+                    }
+                    if (locked && latestBeforeShot.afMode != AfMode.MANUAL) {
+                        if (latestBeforeShot.afMode != AfMode.AI_SERVO) {
+                            soundEngine.playAfBeep()
+                        }
+                        _state.update {
+                            it.copy(
+                                isHalfPressedAfLocked = true,
+                                isSubjectFocused = true,
+                                afFocusPulseSeq = it.afFocusPulseSeq + 1
+                            )
+                        }
+                        delay(45L)
                     }
                 }
             }

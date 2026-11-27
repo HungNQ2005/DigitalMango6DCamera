@@ -7,6 +7,65 @@ package com.studio6d.core.lut
  */
 object FastGuidedFilter {
 
+    private class Workspace(var capacity: Int = 0) {
+        var rCh = FloatArray(0)
+        var gCh = FloatArray(0)
+        var bCh = FloatArray(0)
+        var scratch = FloatArray(0)
+        var prod = FloatArray(0)
+        var rowSum = FloatArray(0)
+        var meanR = FloatArray(0)
+        var meanG = FloatArray(0)
+        var meanB = FloatArray(0)
+        var meanP = FloatArray(0)
+        var meanRR = FloatArray(0)
+        var meanGG = FloatArray(0)
+        var meanBB = FloatArray(0)
+        var meanRP = FloatArray(0)
+        var meanGP = FloatArray(0)
+        var meanBP = FloatArray(0)
+        var aR = FloatArray(0)
+        var aG = FloatArray(0)
+        var aB = FloatArray(0)
+        var bCoeff = FloatArray(0)
+        var meanAR = FloatArray(0)
+        var meanAG = FloatArray(0)
+        var meanAB = FloatArray(0)
+        var meanBCoeff = FloatArray(0)
+
+        fun ensure(total: Int) {
+            if (capacity >= total) return
+            capacity = total
+            rCh = FloatArray(total)
+            gCh = FloatArray(total)
+            bCh = FloatArray(total)
+            scratch = FloatArray(total)
+            prod = FloatArray(total)
+            rowSum = FloatArray(total)
+            meanR = FloatArray(total)
+            meanG = FloatArray(total)
+            meanB = FloatArray(total)
+            meanP = FloatArray(total)
+            meanRR = FloatArray(total)
+            meanGG = FloatArray(total)
+            meanBB = FloatArray(total)
+            meanRP = FloatArray(total)
+            meanGP = FloatArray(total)
+            meanBP = FloatArray(total)
+            aR = FloatArray(total)
+            aG = FloatArray(total)
+            aB = FloatArray(total)
+            bCoeff = FloatArray(total)
+            meanAR = FloatArray(total)
+            meanAG = FloatArray(total)
+            meanAB = FloatArray(total)
+            meanBCoeff = FloatArray(total)
+        }
+    }
+
+    private val lock = Any()
+    private val ws = Workspace()
+
     fun filter(
         guideRgba: ByteArray,
         src: FloatArray,
@@ -20,88 +79,112 @@ object FastGuidedFilter {
             return src.copyOf()
         }
 
-        val rCh = FloatArray(total)
-        val gCh = FloatArray(total)
-        val bCh = FloatArray(total)
-        var ptr = 0
-        for (i in 0 until total) {
-            rCh[i] = (guideRgba[ptr].toInt() and 0xFF) / 255f
-            gCh[i] = (guideRgba[ptr + 1].toInt() and 0xFF) / 255f
-            bCh[i] = (guideRgba[ptr + 2].toInt() and 0xFF) / 255f
-            ptr += 4
+        synchronized(lock) {
+            ws.ensure(total)
+            val rCh = ws.rCh
+            val gCh = ws.gCh
+            val bCh = ws.bCh
+            var ptr = 0
+            val inv255 = 1f / 255f
+            for (i in 0 until total) {
+                rCh[i] = (guideRgba[ptr].toInt() and 0xFF) * inv255
+                gCh[i] = (guideRgba[ptr + 1].toInt() and 0xFF) * inv255
+                bCh[i] = (guideRgba[ptr + 2].toInt() and 0xFF) * inv255
+                ptr += 4
+            }
+
+            val scratch = ws.scratch
+            boxMeanInto(rCh, ws.meanR, width, height, radius, scratch)
+            boxMeanInto(gCh, ws.meanG, width, height, radius, scratch)
+            boxMeanInto(bCh, ws.meanB, width, height, radius, scratch)
+            boxMeanInto(src, ws.meanP, width, height, radius, scratch)
+
+            val prod = ws.prod
+            for (i in 0 until total) prod[i] = rCh[i] * rCh[i]
+            boxMeanInto(prod, ws.meanRR, width, height, radius, scratch)
+            for (i in 0 until total) prod[i] = gCh[i] * gCh[i]
+            boxMeanInto(prod, ws.meanGG, width, height, radius, scratch)
+            for (i in 0 until total) prod[i] = bCh[i] * bCh[i]
+            boxMeanInto(prod, ws.meanBB, width, height, radius, scratch)
+
+            for (i in 0 until total) prod[i] = rCh[i] * src[i]
+            boxMeanInto(prod, ws.meanRP, width, height, radius, scratch)
+            for (i in 0 until total) prod[i] = gCh[i] * src[i]
+            boxMeanInto(prod, ws.meanGP, width, height, radius, scratch)
+            for (i in 0 until total) prod[i] = bCh[i] * src[i]
+            boxMeanInto(prod, ws.meanBP, width, height, radius, scratch)
+
+            val meanR = ws.meanR
+            val meanG = ws.meanG
+            val meanB = ws.meanB
+            val meanP = ws.meanP
+            val meanRR = ws.meanRR
+            val meanGG = ws.meanGG
+            val meanBB = ws.meanBB
+            val meanRP = ws.meanRP
+            val meanGP = ws.meanGP
+            val meanBP = ws.meanBP
+            val aR = ws.aR
+            val aG = ws.aG
+            val aB = ws.aB
+            val bCoeff = ws.bCoeff
+
+            for (i in 0 until total) {
+                val varR = (meanRR[i] - meanR[i] * meanR[i]).coerceAtLeast(0f)
+                val varG = (meanGG[i] - meanG[i] * meanG[i]).coerceAtLeast(0f)
+                val varB = (meanBB[i] - meanB[i] * meanB[i]).coerceAtLeast(0f)
+                val varSum = varR + varG + varB + eps * 3f
+
+                val covRP = meanRP[i] - meanR[i] * meanP[i]
+                val covGP = meanGP[i] - meanG[i] * meanP[i]
+                val covBP = meanBP[i] - meanB[i] * meanP[i]
+
+                val ar = covRP / varSum
+                val ag = covGP / varSum
+                val ab = covBP / varSum
+                aR[i] = ar
+                aG[i] = ag
+                aB[i] = ab
+                bCoeff[i] = meanP[i] - ar * meanR[i] - ag * meanG[i] - ab * meanB[i]
+            }
+
+            boxMeanInto(aR, ws.meanAR, width, height, radius, scratch)
+            boxMeanInto(aG, ws.meanAG, width, height, radius, scratch)
+            boxMeanInto(aB, ws.meanAB, width, height, radius, scratch)
+            boxMeanInto(bCoeff, ws.meanBCoeff, width, height, radius, scratch)
+
+            val meanAR = ws.meanAR
+            val meanAG = ws.meanAG
+            val meanAB = ws.meanAB
+            val meanBCoeff = ws.meanBCoeff
+            val out = FloatArray(total)
+            for (i in 0 until total) {
+                out[i] = (
+                    meanAR[i] * rCh[i] +
+                        meanAG[i] * gCh[i] +
+                        meanAB[i] * bCh[i] +
+                        meanBCoeff[i]
+                    ).coerceIn(0f, 1f)
+            }
+            return out
         }
-
-        val scratch = FloatArray(total)
-        val meanR = boxMean(rCh, width, height, radius, scratch)
-        val meanG = boxMean(gCh, width, height, radius, scratch)
-        val meanB = boxMean(bCh, width, height, radius, scratch)
-        val meanP = boxMean(src, width, height, radius, scratch)
-
-        val prod = FloatArray(total)
-        for (i in 0 until total) prod[i] = rCh[i] * rCh[i]
-        val meanRR = boxMean(prod, width, height, radius, scratch)
-        for (i in 0 until total) prod[i] = gCh[i] * gCh[i]
-        val meanGG = boxMean(prod, width, height, radius, scratch)
-        for (i in 0 until total) prod[i] = bCh[i] * bCh[i]
-        val meanBB = boxMean(prod, width, height, radius, scratch)
-
-        for (i in 0 until total) prod[i] = rCh[i] * src[i]
-        val meanRP = boxMean(prod, width, height, radius, scratch)
-        for (i in 0 until total) prod[i] = gCh[i] * src[i]
-        val meanGP = boxMean(prod, width, height, radius, scratch)
-        for (i in 0 until total) prod[i] = bCh[i] * src[i]
-        val meanBP = boxMean(prod, width, height, radius, scratch)
-
-        val aR = FloatArray(total)
-        val aG = FloatArray(total)
-        val aB = FloatArray(total)
-        val bCoeff = FloatArray(total)
-
-        for (i in 0 until total) {
-            val varR = (meanRR[i] - meanR[i] * meanR[i]).coerceAtLeast(0f)
-            val varG = (meanGG[i] - meanG[i] * meanG[i]).coerceAtLeast(0f)
-            val varB = (meanBB[i] - meanB[i] * meanB[i]).coerceAtLeast(0f)
-            val varSum = varR + varG + varB + eps * 3f
-
-            val covRP = meanRP[i] - meanR[i] * meanP[i]
-            val covGP = meanGP[i] - meanG[i] * meanP[i]
-            val covBP = meanBP[i] - meanB[i] * meanP[i]
-
-            val ar = covRP / varSum
-            val ag = covGP / varSum
-            val ab = covBP / varSum
-            aR[i] = ar
-            aG[i] = ag
-            aB[i] = ab
-            bCoeff[i] = meanP[i] - ar * meanR[i] - ag * meanG[i] - ab * meanB[i]
-        }
-
-        val meanAR = boxMean(aR, width, height, radius, scratch)
-        val meanAG = boxMean(aG, width, height, radius, scratch)
-        val meanAB = boxMean(aB, width, height, radius, scratch)
-        val meanBCoeff = boxMean(bCoeff, width, height, radius, scratch)
-
-        val out = FloatArray(total)
-        for (i in 0 until total) {
-            out[i] = (
-                meanAR[i] * rCh[i] +
-                    meanAG[i] * gCh[i] +
-                    meanAB[i] * bCh[i] +
-                    meanBCoeff[i]
-                ).coerceIn(0f, 1f)
-        }
-        return out
     }
 
-    private fun boxMean(src: FloatArray, w: Int, h: Int, r: Int, horizScratch: FloatArray): FloatArray {
-        val out = FloatArray(w * h)
-        // Horizontal sliding sum -> horizScratch
+    private fun boxMeanInto(
+        src: FloatArray,
+        out: FloatArray,
+        w: Int,
+        h: Int,
+        r: Int,
+        horizScratch: FloatArray
+    ) {
+        // Horizontal sliding sum (row-major) -> horizScratch
+        val rClampedX = r.coerceAtMost(w - 1)
         for (y in 0 until h) {
             val row = y * w
             var sum = 0f
             var count = 0
-            val initEnd = r.coerceAtMost(w - 1)
-            for (x in 0..initEnd) {
+            for (x in 0..rClampedX) {
                 sum += src[row + x]
                 count++
             }
@@ -119,29 +202,40 @@ object FastGuidedFilter {
                 }
             }
         }
-        // Vertical sliding sum -> out
-        for (x in 0 until w) {
-            var sum = 0f
-            var count = 0
-            val initEnd = r.coerceAtMost(h - 1)
-            for (y in 0..initEnd) {
-                sum += horizScratch[y * w + x]
+        // Vertical sliding sum (row-major -> linear L1 cache access!) -> out
+        val rClampedY = r.coerceAtMost(h - 1)
+        val rowSum = ws.rowSum
+        java.util.Arrays.fill(rowSum, 0, w, 0f)
+        var count = 0
+        for (iy in 0..rClampedY) {
+            val rowOff = iy * w
+            for (x in 0 until w) {
+                rowSum[x] += horizScratch[rowOff + x]
+            }
+            count++
+        }
+        for (y in 0 until h) {
+            val invCount = 1f / count
+            val outOff = y * w
+            for (x in 0 until w) {
+                out[outOff + x] = rowSum[x] * invCount
+            }
+            val leave = y - r
+            if (leave >= 0) {
+                val leaveOff = leave * w
+                for (x in 0 until w) {
+                    rowSum[x] -= horizScratch[leaveOff + x]
+                }
+                count--
+            }
+            val enter = y + r + 1
+            if (enter < h) {
+                val enterOff = enter * w
+                for (x in 0 until w) {
+                    rowSum[x] += horizScratch[enterOff + x]
+                }
                 count++
             }
-            for (y in 0 until h) {
-                out[y * w + x] = sum / count
-                val leave = y - r
-                if (leave >= 0) {
-                    sum -= horizScratch[leave * w + x]
-                    count--
-                }
-                val enter = y + r + 1
-                if (enter < h) {
-                    sum += horizScratch[enter * w + x]
-                    count++
-                }
-            }
         }
-        return out
     }
 }

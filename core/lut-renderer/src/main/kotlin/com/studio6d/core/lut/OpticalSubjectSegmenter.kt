@@ -4,6 +4,8 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Matrix
+import android.graphics.Paint
+import android.util.Log
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.segmentation.Segmentation
 import com.google.mlkit.vision.segmentation.selfie.SelfieSegmenterOptions
@@ -28,6 +30,9 @@ import kotlin.math.sqrt
  */
 class OpticalSubjectSegmenter private constructor(@Suppress("UNUSED_PARAMETER") context: Context) {
 
+    private val salientSegmenter = OnnxSalientSegmenter.getInstance(context.applicationContext).also {
+        it.warmUpAsync()
+    }
     private val depthEstimator = OnnxDepthEstimator.getInstance(context.applicationContext).also {
         it.warmUpAsync()
     }
@@ -125,12 +130,13 @@ class OpticalSubjectSegmenter private constructor(@Suppress("UNUSED_PARAMETER") 
         focusNormY: Float,
         lensDiopters: Float,
         isAutoMultiPointAf: Boolean = true,
-        apertureF: Float = 2.0f,
+        apertureF: Float = 2.8f,
         dofWidthScale: Float = 1.0f
     ): SubjectMaskData {
         // NOTE: Never call thumb.recycle() manually; ML Kit's async native workers may outlive coroutine timeouts.
-        val guideW = 600
-        val guideH = 400
+        val tStart = System.currentTimeMillis()
+        val guideW = 576
+        val guideH = 384
         val thumb = createUprightThreeTwoThumb(sourceBitmap, exifDegrees, guideW, guideH)
         val w = thumb.width
         val h = thumb.height
@@ -138,9 +144,137 @@ class OpticalSubjectSegmenter private constructor(@Suppress("UNUSED_PARAMETER") 
         val rgbaBuf = ByteBuffer.allocate(total * 4)
         thumb.copyPixelsToBuffer(rgbaBuf)
         val uprightRgba = rgbaBuf.array()
+        val tThumb = System.currentTimeMillis()
 
-        // Tier 1 (Primary): Offline Depth Anything V2 Small + 3-Channel Fast Guided Filter
+        val fx = (focusNormX.coerceIn(0.02f, 0.98f) * w).roundToInt().coerceIn(0, w - 1)
+        val fy = (focusNormY.coerceIn(0.02f, 0.98f) * h).roundToInt().coerceIn(0, h - 1)
+
+        // Stage 1: Run RMBG-1.4 sequentially first to extract crisp sub-pixel silhouette matte
+        val salientPair = salientSegmenter.segmentForegroundMatte(thumb)
+        val tRmbg = System.currentTimeMillis()
+        var focusedMatte: FloatArray? = null
+        var hasFocusedMatte = false
+        if (salientPair != null) {
+            val (lowSalient, sDims) = salientPair
+            val resampledSalient = if (sDims.first == w && sDims.second == h) {
+                lowSalient
+            } else {
+                resampleBilinear(lowSalient, sDims.first, sDims.second, w, h)
+            }
+            val refinedSalient = FastGuidedFilter.filter(
+                guideRgba = uprightRgba,
+                src = resampledSalient,
+                width = w,
+                height = h,
+                radius = 2,
+                eps = 0.0004f
+            )
+
+            // Keep ONLY the salient silhouette connected to the AF focus point (so secondary
+            // objects elsewhere stay governed by 3D depth rather than staying artificially flat).
+            val radX = (w * 0.075f).roundToInt().coerceAtLeast(6)
+            val radY = (h * 0.075f).roundToInt().coerceAtLeast(6)
+            val sx0 = (fx - radX).coerceAtLeast(0)
+            val sx1 = (fx + radX).coerceAtMost(w - 1)
+            val sy0 = (fy - radY).coerceAtLeast(0)
+            val sy1 = (fy + radY).coerceAtMost(h - 1)
+
+            val visited = BooleanArray(total)
+            val queue = IntArray(total)
+            var qHead = 0
+            var qTail = 0
+            for (yy in sy0..sy1) {
+                val row = yy * w
+                for (xx in sx0..sx1) {
+                    val idx = row + xx
+                    if (!visited[idx] && refinedSalient[idx] >= 0.25f) {
+                        visited[idx] = true
+                        queue[qTail++] = idx
+                    }
+                }
+            }
+
+            if (qTail > 0) {
+                while (qHead < qTail) {
+                    val cur = queue[qHead++]
+                    val cy = cur / w
+                    val cx = cur - cy * w
+                    if (cx > 0) {
+                        val nIdx = cur - 1
+                        if (!visited[nIdx] && refinedSalient[nIdx] >= 0.08f) {
+                            visited[nIdx] = true
+                            queue[qTail++] = nIdx
+                        }
+                    }
+                    if (cx + 1 < w) {
+                        val nIdx = cur + 1
+                        if (!visited[nIdx] && refinedSalient[nIdx] >= 0.08f) {
+                            visited[nIdx] = true
+                            queue[qTail++] = nIdx
+                        }
+                    }
+                    if (cy > 0) {
+                        val nIdx = cur - w
+                        if (!visited[nIdx] && refinedSalient[nIdx] >= 0.08f) {
+                            visited[nIdx] = true
+                            queue[qTail++] = nIdx
+                        }
+                    }
+                    if (cy + 1 < h) {
+                        val nIdx = cur + w
+                        if (!visited[nIdx] && refinedSalient[nIdx] >= 0.08f) {
+                            visited[nIdx] = true
+                            queue[qTail++] = nIdx
+                        }
+                    }
+                }
+
+                // Fast separable 2px outer feather border dilation around connected silhouette
+                val horizExpanded = visited.copyOf()
+                for (y in 0 until h) {
+                    val row = y * w
+                    for (x in 2 until w - 2) {
+                        val idx = row + x
+                        if (visited[idx]) continue
+                        if (visited[idx - 2] || visited[idx - 1] || visited[idx + 1] || visited[idx + 2]) {
+                            horizExpanded[idx] = true
+                        }
+                    }
+                }
+                val expanded = horizExpanded.copyOf()
+                val w2 = w * 2
+                for (y in 2 until h - 2) {
+                    val row = y * w
+                    for (x in 0 until w) {
+                        val idx = row + x
+                        if (horizExpanded[idx]) continue
+                        if (horizExpanded[idx - w2] || horizExpanded[idx - w] ||
+                            horizExpanded[idx + w] || horizExpanded[idx + w2]
+                        ) {
+                            expanded[idx] = true
+                        }
+                    }
+                }
+
+                val outMatte = FloatArray(total)
+                var fgCount = 0
+                for (i in 0 until total) {
+                    val v = if (expanded[i]) refinedSalient[i] else 0f
+                    outMatte[i] = v
+                    if (v >= 0.25f) fgCount++
+                }
+                val matteRatio = fgCount.toFloat() / total.coerceAtLeast(1)
+                if (matteRatio in 0.012f..0.88f) {
+                    focusedMatte = outMatte
+                    hasFocusedMatte = true
+                }
+            }
+        }
+
+        val tPost1 = System.currentTimeMillis()
+        // Stage 2: Run Depth Anything V2 (336x224) sequentially + tight RGB-guided filtering
         val depthResult = depthEstimator.estimateNormalizedDisparity(thumb)
+        val tDepth = System.currentTimeMillis()
         if (depthResult != null) {
             val (lowDisp, dims) = depthResult
             val upsampled = resampleBilinear(lowDisp, dims.first, dims.second, w, h)
@@ -149,57 +283,66 @@ class OpticalSubjectSegmenter private constructor(@Suppress("UNUSED_PARAMETER") 
                 src = upsampled,
                 width = w,
                 height = h,
-                radius = 8,
-                eps = 0.0045f
+                radius = 3,
+                eps = 0.0005f
             )
 
-            val fx = (focusNormX.coerceIn(0.02f, 0.98f) * w).roundToInt().coerceIn(0, w - 1)
-            val fy = (focusNormY.coerceIn(0.02f, 0.98f) * h).roundToInt().coerceIn(0, h - 1)
-            val radX = (w * 0.040f).roundToInt().coerceAtLeast(4)
-            val radY = (h * 0.040f).roundToInt().coerceAtLeast(4)
+            val radX = (w * 0.035f).roundToInt().coerceAtLeast(4)
+            val radY = (h * 0.035f).roundToInt().coerceAtLeast(4)
             val y0 = (fy - radY).coerceAtLeast(0)
             val y1 = (fy + radY).coerceAtMost(h - 1)
             val x0 = (fx - radX).coerceAtLeast(0)
             val x1 = (fx + radX).coerceAtMost(w - 1)
-            val windowSamples = FloatArray((y1 - y0 + 1) * (x1 - x0 + 1))
-            var sCount = 0
+            val maxWin = (y1 - y0 + 1) * (x1 - x0 + 1)
+            val matteSamples = FloatArray(maxWin)
+            val allSamples = FloatArray(maxWin)
+            var mCount = 0
+            var aCount = 0
+            val activeMatte = focusedMatte
             for (yy in y0..y1) {
                 val row = yy * w
                 for (xx in x0..x1) {
-                    windowSamples[sCount++] = guidedDepth[row + xx]
+                    val idx = row + xx
+                    val dVal = guidedDepth[idx]
+                    allSamples[aCount++] = dVal
+                    if (activeMatte != null && activeMatte[idx] > 0.45f) {
+                        matteSamples[mCount++] = dVal
+                    }
                 }
             }
-            windowSamples.sort(0, sCount)
-            val focusDepth = if (sCount > 0) {
-                windowSamples[(sCount * 0.56f).roundToInt().coerceIn(0, sCount - 1)]
+            val focusDepth = if (hasFocusedMatte && mCount >= 8) {
+                matteSamples.sort(0, mCount)
+                matteSamples[(mCount * 0.50f).roundToInt().coerceIn(0, mCount - 1)]
+            } else if (aCount > 0) {
+                allSamples.sort(0, aCount)
+                allSamples[(aCount * 0.55f).roundToInt().coerceIn(0, aCount - 1)]
             } else {
                 guidedDepth[fy * w + fx]
             }
 
-            // Optional human-portrait enhancement: stabilize portrait foreground plane while preserving 3D DoF
-            val selfieAlphas = withTimeoutOrNull(250L) {
-                runSelfieSegmentation(thumb, focusNormX, focusNormY, isAutoMultiPointAf, isLiveStream = false)
-            }
-            if (selfieAlphas != null && selfieAlphas.size >= total) {
-                for (i in 0 until total) {
-                    val sa = selfieAlphas[i]
-                    if (sa > 0.72f) {
-                        guidedDepth[i] = (guidedDepth[i] * 0.60f + focusDepth * 0.40f).coerceIn(0f, 1f)
-                    }
+            val baseHalfWidth = if (hasFocusedMatte) {
+                when {
+                    apertureF <= 1.25f -> 0.034f
+                    apertureF <= 1.50f -> 0.040f
+                    apertureF <= 2.10f -> 0.052f
+                    apertureF <= 2.90f -> 0.068f
+                    apertureF <= 4.10f -> 0.095f
+                    apertureF <= 5.70f -> 0.135f
+                    else -> 0.180f
+                }
+            } else {
+                when {
+                    apertureF <= 1.25f -> 0.075f
+                    apertureF <= 1.50f -> 0.085f
+                    apertureF <= 2.10f -> 0.105f
+                    apertureF <= 2.90f -> 0.135f
+                    apertureF <= 4.10f -> 0.180f
+                    apertureF <= 5.70f -> 0.230f
+                    else -> 0.280f
                 }
             }
-
-            val baseHalfWidth = when {
-                apertureF <= 1.25f -> 0.095f
-                apertureF <= 1.50f -> 0.105f
-                apertureF <= 2.10f -> 0.128f
-                apertureF <= 2.90f -> 0.158f
-                apertureF <= 4.10f -> 0.205f
-                apertureF <= 5.70f -> 0.260f
-                else -> 0.320f
-            }
-            val dofHalfWidth = (baseHalfWidth * dofWidthScale).coerceIn(0.07f, 0.38f)
-            val dofFalloff = 0.29f
+            val dofHalfWidth = (baseHalfWidth * dofWidthScale).coerceIn(0.03f, 0.35f)
+            val dofFalloff = if (hasFocusedMatte) 0.24f else 0.27f
 
             var minD = 1f
             var maxD = 0f
@@ -214,34 +357,78 @@ class OpticalSubjectSegmenter private constructor(@Suppress("UNUSED_PARAMETER") 
                 if (diff > dofHalfWidth * 1.15f) separatedCount++
             }
 
-            if (inFocusCount < (total * 0.015f).toInt() ||
-                separatedCount < (total * 0.04f).toInt() ||
-                (maxD - minD) <= dofHalfWidth * 1.30f
-            ) {
+            val depthOk = if (hasFocusedMatte) {
+                (maxD - minD) > 0.08f
+            } else {
+                inFocusCount >= (total * 0.015f).toInt() &&
+                    separatedCount >= (total * 0.04f).toInt() &&
+                    (maxD - minD) > dofHalfWidth * 1.30f
+            }
+
+            if (depthOk) {
+                val depthBytes = ByteArray(total)
+                val maskBytes = ByteArray(total)
+                for (i in 0 until total) {
+                    val d = guidedDepth[i].coerceIn(0f, 1f)
+                    depthBytes[i] = (d * 255f + 0.5f).toInt().coerceIn(0, 255).toByte()
+                    maskBytes[i] = if (activeMatte != null && hasFocusedMatte) {
+                        (activeMatte[i].coerceIn(0f, 1f) * 255f + 0.5f).toInt().coerceIn(0, 255).toByte()
+                    } else {
+                        val diff = abs(d - focusDepth)
+                        val t = ((diff - dofHalfWidth) / dofFalloff).coerceIn(0f, 1f)
+                        val smooth = t * t * (3f - 2f * t)
+                        val sharp = (1f - smooth).coerceIn(0f, 1f)
+                        (sharp * 255f + 0.5f).toInt().coerceIn(0, 255).toByte()
+                    }
+                }
+
+                Log.i(
+                    "OpticalSubjectSegmenter",
+                    "Still seg ${w}x${h}: thumb=${tThumb - tStart}ms, rmbg=${tRmbg - tThumb}ms, post1=${tPost1 - tRmbg}ms, depth=${tDepth - tPost1}ms, post2=${System.currentTimeMillis() - tDepth}ms, total=${System.currentTimeMillis() - tStart}ms"
+                )
+                return SubjectMaskData(
+                    maskBytes = maskBytes,
+                    width = w,
+                    height = h,
+                    hasSubject = true,
+                    depthBytes = depthBytes,
+                    focusDepth = focusDepth,
+                    dofHalfWidth = dofHalfWidth,
+                    dofFalloff = dofFalloff,
+                    hasSilhouetteMatte = hasFocusedMatte
+                )
+            } else if (activeMatte != null && hasFocusedMatte) {
+                val maskBytes = ByteArray(total)
+                for (i in 0 until total) {
+                    maskBytes[i] = (activeMatte[i].coerceIn(0f, 1f) * 255f + 0.5f).toInt().coerceIn(0, 255).toByte()
+                }
+                Log.i(
+                    "OpticalSubjectSegmenter",
+                    "Still seg ${w}x${h}: thumb=${tThumb - tStart}ms, rmbg=${tRmbg - tThumb}ms, post1=${tPost1 - tRmbg}ms, depth=${tDepth - tPost1}ms, post2=${System.currentTimeMillis() - tDepth}ms, total=${System.currentTimeMillis() - tStart}ms"
+                )
+                return SubjectMaskData(
+                    maskBytes = maskBytes,
+                    width = w,
+                    height = h,
+                    hasSubject = true,
+                    depthBytes = null,
+                    hasSilhouetteMatte = true
+                )
+            } else {
                 return SubjectMaskData.NONE
             }
-
-            val depthBytes = ByteArray(total)
+        } else if (focusedMatte != null && hasFocusedMatte) {
             val maskBytes = ByteArray(total)
             for (i in 0 until total) {
-                val d = guidedDepth[i].coerceIn(0f, 1f)
-                depthBytes[i] = (d * 255f + 0.5f).toInt().coerceIn(0, 255).toByte()
-                val diff = abs(d - focusDepth)
-                val t = ((diff - dofHalfWidth) / dofFalloff).coerceIn(0f, 1f)
-                val smooth = t * t * (3f - 2f * t)
-                val sharp = (1f - smooth).coerceIn(0f, 1f)
-                maskBytes[i] = (sharp * 255f + 0.5f).toInt().coerceIn(0, 255).toByte()
+                maskBytes[i] = (focusedMatte[i].coerceIn(0f, 1f) * 255f + 0.5f).toInt().coerceIn(0, 255).toByte()
             }
-
             return SubjectMaskData(
                 maskBytes = maskBytes,
                 width = w,
                 height = h,
                 hasSubject = true,
-                depthBytes = depthBytes,
-                focusDepth = focusDepth,
-                dofHalfWidth = dofHalfWidth,
-                dofFalloff = dofFalloff
+                depthBytes = null,
+                hasSilhouetteMatte = true
             )
         }
 
@@ -258,7 +445,7 @@ class OpticalSubjectSegmenter private constructor(@Suppress("UNUSED_PARAMETER") 
                 radius = 2,
                 passes = 2
             )
-            return SubjectMaskData(polished, w, height = h, hasSubject = true)
+            return SubjectMaskData(polished, w, height = h, hasSubject = true, hasSilhouetteMatte = true)
         }
 
         return EdgeGuidedFocusSegmenter.computeSubjectMask(
@@ -582,7 +769,7 @@ class OpticalSubjectSegmenter private constructor(@Suppress("UNUSED_PARAMETER") 
         }
         matrix.postScale(scale, scale)
         matrix.postTranslate(outW / 2f, outH / 2f)
-        canvas.drawBitmap(source, matrix, null)
+        canvas.drawBitmap(source, matrix, Paint(Paint.FILTER_BITMAP_FLAG))
         return out
     }
 

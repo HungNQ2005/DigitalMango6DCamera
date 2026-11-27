@@ -867,7 +867,7 @@ fun TwoStageShutterButton(
                     pressed = true
                     haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                     val holdJob = scope.launch {
-                        delay(35L)
+                        delay(165L)
                         haptic.performHapticFeedback(HapticFeedbackType.LongPress)
                         onHalfPressUpdated()
                     }
@@ -878,9 +878,9 @@ fun TwoStageShutterButton(
                     holdJob.cancel()
                     pressed = false
                     val heldMs = System.currentTimeMillis() - downMs
-                    if (heldMs < 185L) {
+                    if (heldMs < 280L) {
                         onShutterFireUpdated(false)
-                    } else {
+                    } else if (heldMs >= 165L) {
                         onReleaseHalfPressUpdated()
                     }
                 }

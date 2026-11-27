@@ -104,18 +104,52 @@ class Camera2DslrController(
     var displayRotation: Int = Surface.ROTATION_90
 
     private var lastTelemetryMs: Long = 0L
+    private enum class AfSeekPhase {
+        IDLE,
+        WAIT_AUTO_READY,
+        ACTIVE_AUTO_SCAN,
+        CAF_FALLBACK_SCAN
+    }
+
     @Volatile
     private var awaitingAfLock: Boolean = false
+    @Volatile
+    private var afSeekPhase: AfSeekPhase = AfSeekPhase.IDLE
+    @Volatile
+    private var afPhaseStartMs: Long = 0L
     @Volatile
     private var sawActiveScan: Boolean = false
     @Volatile
     private var afRetryCount: Int = 0
     private var afLockTimeoutRunnable: Runnable? = null
-    private var afResweepRunnable: Runnable? = null
     @Volatile
     private var afTriggerStartMs: Long = 0L
     @Volatile
+    private var afTriggerStartFrame: Long = Long.MAX_VALUE
+    @Volatile
+    private var afModeSwitchMinFrame: Long = Long.MAX_VALUE
+    @Volatile
+    private var autoReadyFrames: Int = 0
+    @Volatile
+    private var stableFocusFrames: Int = 0
+    @Volatile
+    private var prevFrameDiopters: Float = -1f
+    @Volatile
     private var lastLensMoving: Boolean = false
+    @Volatile
+    private var lastLockedFocusNormX: Float = -1f
+    @Volatile
+    private var lastLockedFocusNormY: Float = -1f
+    @Volatile
+    private var lastLockedTimestampMs: Long = 0L
+    @Volatile
+    private var lastAfState: Int? = null
+    @Volatile
+    private var lastObservedHalAfMode: Int? = null
+    @Volatile
+    private var lastRequestedHalAfMode: Int = CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE
+    @Volatile
+    private var hasParkedSinglePointAf: Boolean = false
 
     @Volatile
     private var userAfActive: Boolean = false
@@ -248,11 +282,33 @@ class Camera2DslrController(
                 inPreferredConfig = Bitmap.Config.RGB_565
             }
             val raw = BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size, opts) ?: return null
-            if (exifDegrees == 0) return raw
-            val m = Matrix().apply { postRotate(exifDegrees.toFloat()) }
-            val rotated = Bitmap.createBitmap(raw, 0, 0, raw.width, raw.height, m, true)
-            if (rotated !== raw) raw.recycle()
-            rotated
+            val upright = if (exifDegrees == 0) {
+                raw
+            } else {
+                val m = Matrix().apply { postRotate(exifDegrees.toFloat()) }
+                val rotated = Bitmap.createBitmap(raw, 0, 0, raw.width, raw.height, m, true)
+                if (rotated !== raw) raw.recycle()
+                rotated
+            }
+            val aspect = upright.width.toFloat() / upright.height.toFloat().coerceAtLeast(1f)
+            val targetAspect = 1.5f
+            if (kotlin.math.abs(aspect - targetAspect) < 0.02f) {
+                return@runCatching upright
+            }
+            val cropW: Int
+            val cropH: Int
+            if (aspect > targetAspect) {
+                cropH = upright.height
+                cropW = (cropH * targetAspect).roundToInt().coerceIn(2, upright.width)
+            } else {
+                cropW = upright.width
+                cropH = (cropW / targetAspect).roundToInt().coerceIn(2, upright.height)
+            }
+            val left = ((upright.width - cropW) / 2).coerceAtLeast(0)
+            val top = ((upright.height - cropH) / 2).coerceAtLeast(0)
+            val cropped = Bitmap.createBitmap(upright, left, top, cropW, cropH)
+            if (cropped !== upright) upright.recycle()
+            cropped
         }.getOrNull()
     }
 
@@ -500,6 +556,10 @@ class Camera2DslrController(
         val device = cameraDevice ?: return
         val caps = _capabilities.value
 
+        if (settings.isAutoAfSelection) {
+            hasParkedSinglePointAf = false
+        }
+
         val needsRaw = caps != null && settings.saveRawDng && caps.supportsRawDng && caps.rawSize != null
         val sessionNeedsRebuild = needsRaw != sessionWithRaw
         if (awaitingAfLock && !sessionNeedsRebuild) {
@@ -519,12 +579,12 @@ class Camera2DslrController(
         if (!preview.isValid) return
 
         runCatching {
-            val afRect = buildMeteringRect(settings.customFocusNormX, settings.customFocusNormY, settings.zoomRatio, halfExtentFrac = 0.075f)
+            val afRect = buildMeteringRect(settings.customFocusNormX, settings.customFocusNormY, settings.zoomRatio, halfExtentFrac = 0.10f)
             val aeRect = buildAeMeteringRect(settings)
             val builder = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
                 addTarget(preview)
                 set(CaptureRequest.CONTROL_CAPTURE_INTENT, CameraMetadata.CONTROL_CAPTURE_INTENT_PREVIEW)
-                applyDslrControls(this, settings, afRect = afRect, aeRect = aeRect, isStillCapture = false, forceActiveAfMode = false)
+                applyDslrControls(this, settings, afRect = afRect, aeRect = aeRect, isStillCapture = false, afModeOverride = null)
             }
             session.setRepeatingRequest(builder.build(), previewCallback, cameraHandler)
         }
@@ -538,31 +598,50 @@ class Camera2DslrController(
     suspend fun acquireFocusForShutter(settings: CameraSettingsState): Boolean {
         if (settings.afMode == AfMode.MANUAL) {
             userAfActive = false
+            afSeekPhase = AfSeekPhase.IDLE
             _afLocked.value = true
             _isSubjectFocused.value = true
             _isAfHunting.value = false
+            android.util.Log.i("Camera2DslrController", "AF MANUAL ready diopters=${settings.manualFocusDiopter}")
             return true
         }
-        if (_afLocked.value && _isSubjectFocused.value && !_isAfHunting.value) {
+        val recentlyLockedSameSpot = _afLocked.value &&
+            _isSubjectFocused.value &&
+            !_isAfHunting.value &&
+            !awaitingAfLock &&
+            kotlin.math.abs(settings.customFocusNormX - lastLockedFocusNormX) < 0.025f &&
+            kotlin.math.abs(settings.customFocusNormY - lastLockedFocusNormY) < 0.025f &&
+            (System.currentTimeMillis() - lastLockedTimestampMs) < 8000L
+        if (recentlyLockedSameSpot) {
             userAfActive = false
             _afPulseSeq.value += 1
             return true
         }
 
         val deferred = CompletableDeferred<Boolean>()
+        val alreadyHuntingSameSpot = awaitingAfLock &&
+            kotlin.math.abs(settings.customFocusNormX - activeSettings.customFocusNormX) < 0.025f &&
+            kotlin.math.abs(settings.customFocusNormY - activeSettings.customFocusNormY) < 0.025f
         pendingFocusDeferred?.complete(false)
         pendingFocusDeferred = deferred
         userAfActive = true
         _isAfHunting.value = true
 
-        focusAtPoint(settings.customFocusNormX, settings.customFocusNormY, settings)
+        if (!alreadyHuntingSameSpot) {
+            focusAtPoint(settings.customFocusNormX, settings.customFocusNormY, settings)
+        }
 
-        val result = withTimeoutOrNull(1600L) {
+        val result = withTimeoutOrNull(5600L) {
             deferred.await()
-        } ?: _isSubjectFocused.value
+        } ?: false
 
         if (pendingFocusDeferred === deferred) {
             pendingFocusDeferred = null
+        }
+        if (!result && awaitingAfLock) {
+            awaitingAfLock = false
+            afSeekPhase = AfSeekPhase.IDLE
+            cancelAfFallbackPulse()
         }
         userAfActive = false
         _isAfHunting.value = false
@@ -571,10 +650,18 @@ class Camera2DslrController(
 
     fun focusAtPoint(normX: Float, normY: Float, settings: CameraSettingsState) {
         activeSettings = settings
+        if (settings.isAutoAfSelection) {
+            hasParkedSinglePointAf = false
+        }
         if (settings.afMode == AfMode.MANUAL) {
             userAfActive = false
             awaitingAfLock = false
+            afSeekPhase = AfSeekPhase.IDLE
             sawActiveScan = false
+            afTriggerStartFrame = Long.MAX_VALUE
+            afModeSwitchMinFrame = Long.MAX_VALUE
+            autoReadyFrames = 0
+            stableFocusFrames = 0
             _afLocked.value = true
             _isSubjectFocused.value = true
             _isPassiveFocused.value = true
@@ -589,20 +676,25 @@ class Camera2DslrController(
         awaitingAfLock = true
         sawActiveScan = false
         afRetryCount = 0
-        afTriggerStartMs = System.currentTimeMillis()
+        val now = System.currentTimeMillis()
+        afTriggerStartMs = now
+        afPhaseStartMs = now
+        afTriggerStartFrame = Long.MAX_VALUE
+        afModeSwitchMinFrame = Long.MAX_VALUE
+        autoReadyFrames = 0
+        stableFocusFrames = 0
         _afLocked.value = false
         _isSubjectFocused.value = false
         _isAfHunting.value = true
 
         cameraHandler?.post {
-            afResweepRunnable?.let { cameraHandler?.removeCallbacks(it) }
-            afResweepRunnable = null
             val device = cameraDevice
             val session = captureSession
             val preview = previewSurface
             if (device == null || session == null || preview == null || !preview.isValid) {
                 userAfActive = false
                 awaitingAfLock = false
+                afSeekPhase = AfSeekPhase.IDLE
                 _afLocked.value = true
                 _isSubjectFocused.value = true
                 _isPassiveFocused.value = true
@@ -613,37 +705,79 @@ class Camera2DslrController(
                 return@post
             }
 
-            val afRect = buildMeteringRect(normX, normY, settings.zoomRatio, halfExtentFrac = 0.075f)
+            val afRect = buildMeteringRect(normX, normY, settings.zoomRatio, halfExtentFrac = 0.10f)
             val aeRect = buildAeMeteringRect(settings.copy(customFocusNormX = normX, customFocusNormY = normY))
+            android.util.Log.i(
+                "Camera2DslrController",
+                "AF START mode=${settings.afMode} pt=(${"%.2f".format(Locale.US, normX)}, ${"%.2f".format(Locale.US, normY)}) autoSel=${settings.isAutoAfSelection}"
+            )
             scheduleAfFallbackPulse()
 
             runCatching {
-                val forceAuto = settings.afMode == AfMode.ONE_SHOT || _capabilities.value?.supportsContinuousPictureAf != true
-                val cancelBuilder = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
-                    addTarget(preview)
-                    set(CaptureRequest.CONTROL_CAPTURE_INTENT, CameraMetadata.CONTROL_CAPTURE_INTENT_PREVIEW)
-                    applyDslrControls(this, settings, afRect = afRect, aeRect = aeRect, isStillCapture = false, forceActiveAfMode = forceAuto)
-                    set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_CANCEL)
-                }
-                session.capture(cancelBuilder.build(), previewCallback, cameraHandler)
+                val useContinuousOnly = settings.afMode == AfMode.AI_SERVO &&
+                    settings.isAutoAfSelection &&
+                    _capabilities.value?.supportsContinuousPictureAf == true
+                if (useContinuousOnly) {
+                    startCafFallbackScan(settings, afRect, aeRect)
+                } else {
+                    afSeekPhase = AfSeekPhase.WAIT_AUTO_READY
+                    afPhaseStartMs = System.currentTimeMillis()
+                    afModeSwitchMinFrame = Long.MAX_VALUE
+                    autoReadyFrames = 0
 
-                val repeatingBuilder = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
-                    addTarget(preview)
-                    set(CaptureRequest.CONTROL_CAPTURE_INTENT, CameraMetadata.CONTROL_CAPTURE_INTENT_PREVIEW)
-                    applyDslrControls(this, settings, afRect = afRect, aeRect = aeRect, isStillCapture = false, forceActiveAfMode = forceAuto)
-                }
-                session.setRepeatingRequest(repeatingBuilder.build(), previewCallback, cameraHandler)
+                    if (lastObservedHalAfMode == CameraMetadata.CONTROL_AF_MODE_AUTO &&
+                        (lastAfState == CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED ||
+                            lastAfState == CaptureResult.CONTROL_AF_STATE_NOT_FOCUSED_LOCKED ||
+                            lastAfState == CaptureResult.CONTROL_AF_STATE_ACTIVE_SCAN)
+                    ) {
+                        val cancelReq = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
+                            addTarget(preview)
+                            set(CaptureRequest.CONTROL_CAPTURE_INTENT, CameraMetadata.CONTROL_CAPTURE_INTENT_PREVIEW)
+                            applyDslrControls(
+                                this,
+                                settings,
+                                afRect = afRect,
+                                aeRect = aeRect,
+                                isStillCapture = false,
+                                afModeOverride = CameraMetadata.CONTROL_AF_MODE_AUTO
+                            )
+                            set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_CANCEL)
+                        }
+                        session.capture(
+                            cancelReq.build(),
+                            firstFrameCaptureCallback { frameNumber ->
+                                afModeSwitchMinFrame = frameNumber + 1L
+                            },
+                            cameraHandler
+                        )
+                    }
 
-                val triggerBuilder = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
-                    addTarget(preview)
-                    set(CaptureRequest.CONTROL_CAPTURE_INTENT, CameraMetadata.CONTROL_CAPTURE_INTENT_PREVIEW)
-                    applyDslrControls(this, settings, afRect = afRect, aeRect = aeRect, isStillCapture = false, forceActiveAfMode = forceAuto)
-                    set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_START)
+                    val autoIdleReq = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
+                        addTarget(preview)
+                        set(CaptureRequest.CONTROL_CAPTURE_INTENT, CameraMetadata.CONTROL_CAPTURE_INTENT_PREVIEW)
+                        applyDslrControls(
+                            this,
+                            settings,
+                            afRect = afRect,
+                            aeRect = aeRect,
+                            isStillCapture = false,
+                            afModeOverride = CameraMetadata.CONTROL_AF_MODE_AUTO
+                        )
+                    }
+                    session.setRepeatingRequest(
+                        autoIdleReq.build(),
+                        firstFrameCaptureCallback { frameNumber ->
+                            if (afModeSwitchMinFrame == Long.MAX_VALUE) {
+                                afModeSwitchMinFrame = frameNumber
+                            }
+                        },
+                        cameraHandler
+                    )
                 }
-                session.capture(triggerBuilder.build(), previewCallback, cameraHandler)
             }.onFailure {
                 userAfActive = false
                 awaitingAfLock = false
+                afSeekPhase = AfSeekPhase.IDLE
                 cancelAfFallbackPulse()
                 _isAfHunting.value = false
                 _afLocked.value = true
@@ -664,6 +798,7 @@ class Camera2DslrController(
         _isAfHunting.value = false
         cameraHandler?.post {
             awaitingAfLock = false
+            afSeekPhase = AfSeekPhase.IDLE
             sawActiveScan = false
             cancelAfFallbackPulse()
             _afLocked.value = false
@@ -676,17 +811,32 @@ class Camera2DslrController(
             if (!preview.isValid) return@post
 
             runCatching {
-                val afRect = buildMeteringRect(activeSettings.customFocusNormX, activeSettings.customFocusNormY, activeSettings.zoomRatio, halfExtentFrac = 0.075f)
-                val aeRect = buildAeMeteringRect(activeSettings)
-                val cancelBuilder = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
-                    addTarget(preview)
-                    set(CaptureRequest.CONTROL_CAPTURE_INTENT, CameraMetadata.CONTROL_CAPTURE_INTENT_PREVIEW)
-                    applyDslrControls(this, activeSettings, afRect = afRect, aeRect = aeRect, isStillCapture = false, forceActiveAfMode = false)
-                    set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_CANCEL)
+                if (lastRequestedHalAfMode == CameraMetadata.CONTROL_AF_MODE_AUTO &&
+                    (lastAfState == CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED ||
+                        lastAfState == CaptureResult.CONTROL_AF_STATE_NOT_FOCUSED_LOCKED ||
+                        lastAfState == CaptureResult.CONTROL_AF_STATE_ACTIVE_SCAN)
+                ) {
+                    val afRect = buildMeteringRect(activeSettings.customFocusNormX, activeSettings.customFocusNormY, activeSettings.zoomRatio, halfExtentFrac = 0.10f)
+                    val aeRect = buildAeMeteringRect(activeSettings)
+                    val cancelBuilder = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
+                        addTarget(preview)
+                        set(CaptureRequest.CONTROL_CAPTURE_INTENT, CameraMetadata.CONTROL_CAPTURE_INTENT_PREVIEW)
+                        applyDslrControls(
+                            this,
+                            activeSettings,
+                            afRect = afRect,
+                            aeRect = aeRect,
+                            isStillCapture = false,
+                            afModeOverride = CameraMetadata.CONTROL_AF_MODE_AUTO
+                        )
+                        set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_CANCEL)
+                    }
+                    session.capture(cancelBuilder.build(), previewCallback, cameraHandler)
                 }
-                session.capture(cancelBuilder.build(), previewCallback, cameraHandler)
+                applyPreviewLocked(activeSettings)
+            }.onFailure {
+                applyPreviewLocked(activeSettings)
             }
-            applyPreviewLocked(activeSettings)
         }
     }
 
@@ -763,6 +913,11 @@ class Camera2DslrController(
                         removePendingBufferItem(meta.captureId)
                         return@Runnable
                     }
+                    val stillAfMode = if (settings.afMode == AfMode.MANUAL) {
+                        CameraMetadata.CONTROL_AF_MODE_OFF
+                    } else {
+                        lastRequestedHalAfMode
+                    }
                     val builder = activeDev.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
                         // Keep preview stream fed during still ISP processing so Live View never blacks out
                         previewSurface?.takeIf { it.isValid }?.let { addTarget(it) }
@@ -778,7 +933,7 @@ class Camera2DslrController(
                             aeRect = aeRect,
                             isStillCapture = true,
                             evBiasOverride = evBiasOverride,
-                            forceActiveAfMode = caps?.supportsContinuousPictureAf != true && _afLocked.value,
+                            afModeOverride = stillAfMode,
                             forceFlashTorch = fireFlash
                         )
                         set(CaptureRequest.JPEG_QUALITY, 98.toByte())
@@ -811,19 +966,32 @@ class Camera2DslrController(
                                     trySavePendingDng()
                                 }
                                 if (unlockAfAfterCapture) {
+                                    afSeekPhase = AfSeekPhase.IDLE
                                     awaitingAfLock = false
                                     sawActiveScan = false
                                     _afLocked.value = false
                                     _isSubjectFocused.value = false
-                                    runCatching {
-                                        previewSurface?.takeIf { it.isValid }?.let { prev ->
-                                            val cancelReq = activeDev.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
-                                                addTarget(prev)
-                                                set(CaptureRequest.CONTROL_CAPTURE_INTENT, CameraMetadata.CONTROL_CAPTURE_INTENT_PREVIEW)
-                                                applyDslrControls(this, activeSettings, afRect = afRect, aeRect = aeRect, isStillCapture = false, forceActiveAfMode = false)
-                                                set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_CANCEL)
+                                    if (lastRequestedHalAfMode == CameraMetadata.CONTROL_AF_MODE_AUTO &&
+                                        (lastAfState == CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED ||
+                                            lastAfState == CaptureResult.CONTROL_AF_STATE_NOT_FOCUSED_LOCKED)
+                                    ) {
+                                        runCatching {
+                                            previewSurface?.takeIf { it.isValid }?.let { prev ->
+                                                val cancelReq = activeDev.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
+                                                    addTarget(prev)
+                                                    set(CaptureRequest.CONTROL_CAPTURE_INTENT, CameraMetadata.CONTROL_CAPTURE_INTENT_PREVIEW)
+                                                    applyDslrControls(
+                                                        this,
+                                                        activeSettings,
+                                                        afRect = afRect,
+                                                        aeRect = aeRect,
+                                                        isStillCapture = false,
+                                                        afModeOverride = CameraMetadata.CONTROL_AF_MODE_AUTO
+                                                    )
+                                                    set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_CANCEL)
+                                                }
+                                                session.capture(cancelReq.build(), previewCallback, cameraHandler)
                                             }
-                                            session.capture(cancelReq.build(), previewCallback, cameraHandler)
                                         }
                                     }
                                 }
@@ -843,6 +1011,7 @@ class Camera2DslrController(
                                 }
                                 _lastSavedEvent.value = "Capture failed: ${failure.reason}"
                                 if (unlockAfAfterCapture) {
+                                    afSeekPhase = AfSeekPhase.IDLE
                                     awaitingAfLock = false
                                     sawActiveScan = false
                                     _afLocked.value = false
@@ -865,6 +1034,11 @@ class Camera2DslrController(
             if (torchPrewarm) {
                 // Pre-warm CMOS flash synchronization for 95ms so high manual shutter speeds never get partial dark bands
                 runCatching {
+                    val prewarmAfMode = if (settings.afMode == AfMode.MANUAL) {
+                        CameraMetadata.CONTROL_AF_MODE_OFF
+                    } else {
+                        lastRequestedHalAfMode
+                    }
                     val prewarmBuilder = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
                         previewSurface?.takeIf { it.isValid }?.let { addTarget(it) }
                         set(CaptureRequest.CONTROL_CAPTURE_INTENT, CameraMetadata.CONTROL_CAPTURE_INTENT_PREVIEW)
@@ -874,7 +1048,7 @@ class Camera2DslrController(
                             afRect = afRect,
                             aeRect = aeRect,
                             isStillCapture = false,
-                            forceActiveAfMode = _afLocked.value,
+                            afModeOverride = prewarmAfMode,
                             forceFlashTorch = true
                         )
                     }
@@ -894,12 +1068,13 @@ class Camera2DslrController(
         aeRect: MeteringRectangle? = null,
         isStillCapture: Boolean = false,
         evBiasOverride: Float? = null,
-        forceActiveAfMode: Boolean = false,
+        afModeOverride: Int? = null,
         forceFlashTorch: Boolean = false
     ) {
         val caps = _capabilities.value
 
         builder.set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_OFF)
+        builder.set(CaptureRequest.STATISTICS_FACE_DETECT_MODE, CameraMetadata.STATISTICS_FACE_DETECT_MODE_OFF)
         if (caps?.supportsOis == true) {
             builder.set(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE, CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON)
         }
@@ -957,9 +1132,10 @@ class Camera2DslrController(
             }
             builder.set(CaptureRequest.CONTROL_AE_LOCK, settings.isAeLocked)
 
-            if (caps != null && (settings.exposureMode.allowsExposureCompensation || evBiasOverride != null)) {
+            if (caps != null) {
                 val baseEv = if (settings.exposureMode.allowsExposureCompensation) settings.evCompensation else 0f
-                val totalEv = baseEv + (evBiasOverride ?: 0f)
+                val canonAeLift = 0.40f
+                val totalEv = baseEv + canonAeLift + (evBiasOverride ?: 0f)
                 val steps = (totalEv / caps.evStep).roundToInt()
                     .coerceIn(caps.evRangeSteps.lower, caps.evRangeSteps.upper)
                 builder.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, steps)
@@ -978,26 +1154,27 @@ class Camera2DslrController(
             builder.set(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_AUTO)
         }
 
-        // One-Shot AF uses CONTROL_AF_MODE_AUTO so VCM optics physically hunt and confirm sharpness on trigger;
-        // AI Servo / AI Focus use CONTINUOUS_PICTURE for continuous tracking.
-        when {
-            settings.afMode == AfMode.MANUAL -> {
-                builder.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_OFF)
-                val maxDiopter = caps?.minFocusDistance ?: 10f
-                builder.set(
-                    CaptureRequest.LENS_FOCUS_DISTANCE,
-                    settings.manualFocusDiopter.coerceIn(0f, maxDiopter)
-                )
-            }
-            settings.afMode == AfMode.ONE_SHOT || forceActiveAfMode -> {
-                builder.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_AUTO)
-            }
-            caps?.supportsContinuousPictureAf == true -> {
-                builder.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
-            }
-            else -> {
-                builder.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_AUTO)
-            }
+        // Use frame-synchronized CONTROL_AF_MODE_AUTO for targeted/locked AF and CONTINUOUS_PICTURE for
+        // open 11-pt tracking; park single-point focus in AUTO so CAF never re-centers onto [1678..2322].
+        val targetAfMode = when {
+            settings.afMode == AfMode.MANUAL -> CameraMetadata.CONTROL_AF_MODE_OFF
+            afModeOverride != null -> afModeOverride
+            caps?.supportsContinuousPictureAf != true -> CameraMetadata.CONTROL_AF_MODE_AUTO
+            (_afLocked.value && settings.afMode == AfMode.ONE_SHOT) ||
+                (!settings.isAutoAfSelection && hasParkedSinglePointAf && settings.afMode != AfMode.AI_SERVO) ->
+                CameraMetadata.CONTROL_AF_MODE_AUTO
+            else -> CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE
+        }
+        builder.set(CaptureRequest.CONTROL_AF_MODE, targetAfMode)
+        if (settings.afMode == AfMode.MANUAL) {
+            val maxDiopter = caps?.minFocusDistance ?: 10f
+            builder.set(
+                CaptureRequest.LENS_FOCUS_DISTANCE,
+                settings.manualFocusDiopter.coerceIn(0f, maxDiopter)
+            )
+        }
+        if (!isStillCapture) {
+            lastRequestedHalAfMode = targetAfMode
         }
 
         if (afRect != null && settings.afMode != AfMode.MANUAL) {
@@ -1013,7 +1190,7 @@ class Camera2DslrController(
             MeteringMode.SPOT -> buildMeteringRect(0.50f, 0.50f, settings.zoomRatio, halfExtentFrac = 0.035f)
             MeteringMode.PARTIAL -> buildMeteringRect(0.50f, 0.50f, settings.zoomRatio, halfExtentFrac = 0.065f)
             MeteringMode.CENTER_WEIGHTED -> buildMeteringRect(0.50f, 0.50f, settings.zoomRatio, halfExtentFrac = 0.26f)
-            MeteringMode.EVALUATIVE -> null // Full-frame 63-zone matrix metering prevents dark subjects from blowing out highlights
+            MeteringMode.EVALUATIVE -> buildMeteringRect(settings.customFocusNormX, settings.customFocusNormY, settings.zoomRatio, halfExtentFrac = 0.24f)
         }
     }
 
@@ -1104,77 +1281,195 @@ class Camera2DslrController(
         return (sensorOrientation - deviceDegrees + 360) % 360
     }
 
+    private fun firstFrameCaptureCallback(onFirstFrame: (Long) -> Unit): CameraCaptureSession.CaptureCallback {
+        return object : CameraCaptureSession.CaptureCallback() {
+            private var firstFrameLatched = false
+
+            override fun onCaptureStarted(
+                session: CameraCaptureSession,
+                request: CaptureRequest,
+                timestamp: Long,
+                frameNumber: Long
+            ) {
+                if (!firstFrameLatched) {
+                    firstFrameLatched = true
+                    onFirstFrame(frameNumber)
+                }
+            }
+
+            override fun onCaptureCompleted(
+                session: CameraCaptureSession,
+                request: CaptureRequest,
+                result: TotalCaptureResult
+            ) {
+                if (!firstFrameLatched) {
+                    firstFrameLatched = true
+                    onFirstFrame(result.frameNumber)
+                }
+                previewCallback.onCaptureCompleted(session, request, result)
+            }
+        }
+    }
+
+    private fun failAfSeek(logMessage: String) {
+        android.util.Log.w("Camera2DslrController", logMessage)
+        userAfActive = false
+        awaitingAfLock = false
+        afSeekPhase = AfSeekPhase.IDLE
+        sawActiveScan = false
+        stableFocusFrames = 0
+        autoReadyFrames = 0
+        cancelAfFallbackPulse()
+        _isAfHunting.value = false
+        _afLocked.value = false
+        _isSubjectFocused.value = false
+        _afLockFailedSeq.value += 1
+        pendingFocusDeferred?.complete(false)
+    }
+
+    private fun startCafFallbackScan(
+        settings: CameraSettingsState = activeSettings,
+        afRectOverride: MeteringRectangle? = null,
+        aeRectOverride: MeteringRectangle? = null
+    ) {
+        if (_capabilities.value?.supportsContinuousPictureAf != true) {
+            failAfSeek("AF FAILED mode=${settings.afMode} CAF unsupported after AUTO")
+            return
+        }
+        val device = cameraDevice ?: return
+        val session = captureSession ?: return
+        val preview = previewSurface ?: return
+        if (!preview.isValid) return
+
+        val afRect = afRectOverride ?: buildMeteringRect(settings.customFocusNormX, settings.customFocusNormY, settings.zoomRatio, halfExtentFrac = 0.10f)
+        val aeRect = aeRectOverride ?: buildAeMeteringRect(settings)
+        afSeekPhase = AfSeekPhase.CAF_FALLBACK_SCAN
+        afPhaseStartMs = System.currentTimeMillis()
+        afTriggerStartFrame = Long.MAX_VALUE
+        sawActiveScan = false
+        stableFocusFrames = 0
+        autoReadyFrames = 0
+
+        android.util.Log.i(
+            "Camera2DslrController",
+            "AF CAF_FALLBACK pt=(${"%.2f".format(Locale.US, settings.customFocusNormX)}, ${"%.2f".format(Locale.US, settings.customFocusNormY)})"
+        )
+        runCatching {
+            val cafReq = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
+                addTarget(preview)
+                set(CaptureRequest.CONTROL_CAPTURE_INTENT, CameraMetadata.CONTROL_CAPTURE_INTENT_PREVIEW)
+                applyDslrControls(
+                    this,
+                    settings,
+                    afRect = afRect,
+                    aeRect = aeRect,
+                    isStillCapture = false,
+                    afModeOverride = CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE
+                )
+            }
+            session.setRepeatingRequest(
+                cafReq.build(),
+                firstFrameCaptureCallback { frameNumber ->
+                    if (frameNumber < afTriggerStartFrame) {
+                        afTriggerStartFrame = frameNumber
+                    }
+                },
+                cameraHandler
+            )
+        }.onFailure {
+            failAfSeek("AF CAF_FALLBACK request failed")
+        }
+    }
+
+    private fun lockCafPositionAndConfirm(curDiopter: Float, frameNum: Long, elapsedMs: Long) {
+        val settings = activeSettings
+        userAfActive = false
+        awaitingAfLock = false
+        afSeekPhase = AfSeekPhase.IDLE
+        sawActiveScan = false
+        afRetryCount = 0
+        stableFocusFrames = 0
+        autoReadyFrames = 0
+        hasParkedSinglePointAf = !settings.isAutoAfSelection
+        cancelAfFallbackPulse()
+        lastLockedFocusNormX = settings.customFocusNormX
+        lastLockedFocusNormY = settings.customFocusNormY
+        lastLockedTimestampMs = System.currentTimeMillis()
+
+        val device = cameraDevice
+        val session = captureSession
+        val preview = previewSurface
+        if (device != null && session != null && preview != null && preview.isValid) {
+            val afRect = buildMeteringRect(settings.customFocusNormX, settings.customFocusNormY, settings.zoomRatio, halfExtentFrac = 0.10f)
+            val aeRect = buildAeMeteringRect(settings)
+            val parkOverride: Int? = when {
+                settings.afMode == AfMode.ONE_SHOT &&
+                    lastRequestedHalAfMode != CameraMetadata.CONTROL_AF_MODE_AUTO ->
+                    CameraMetadata.CONTROL_AF_MODE_AUTO
+                settings.afMode == AfMode.AI_FOCUS &&
+                    settings.isAutoAfSelection &&
+                    _capabilities.value?.supportsContinuousPictureAf == true &&
+                    lastRequestedHalAfMode != CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE ->
+                    CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE
+                else -> null
+            }
+            if (parkOverride != null) {
+                runCatching {
+                    val parkReq = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
+                        addTarget(preview)
+                        set(CaptureRequest.CONTROL_CAPTURE_INTENT, CameraMetadata.CONTROL_CAPTURE_INTENT_PREVIEW)
+                        applyDslrControls(
+                            this,
+                            settings,
+                            afRect = afRect,
+                            aeRect = aeRect,
+                            isStillCapture = false,
+                            afModeOverride = parkOverride
+                        )
+                    }
+                    session.setRepeatingRequest(parkReq.build(), previewCallback, cameraHandler)
+                }
+            }
+        }
+
+        android.util.Log.i(
+            "Camera2DslrController",
+            "AF LOCKED mode=${settings.afMode} halMode=$lastRequestedHalAfMode in ${elapsedMs}ms (diopters=${"%.2f".format(Locale.US, curDiopter)}, frame=$frameNum, sawScan=$sawActiveScan)"
+        )
+        _isAfHunting.value = false
+        _afLocked.value = true
+        _isSubjectFocused.value = true
+        if (settings.afMode != AfMode.AI_SERVO) {
+            _afPulseSeq.value += 1
+        }
+        _afLockConfirmedSeq.value += 1
+        pendingFocusDeferred?.complete(true)
+    }
+
     private fun scheduleAfFallbackPulse() {
         val h = cameraHandler ?: return
         cancelAfFallbackPulse()
         val r = Runnable {
             if (awaitingAfLock) {
-                val halIgnoredTrigger = !sawActiveScan && !lastLensMoving
-                userAfActive = false
-                awaitingAfLock = false
-                sawActiveScan = false
-                _isAfHunting.value = false
-                if (halIgnoredTrigger) {
-                    _afLocked.value = true
-                    _isSubjectFocused.value = true
-                    _afPulseSeq.value += 1
-                    _afLockConfirmedSeq.value += 1
-                    pendingFocusDeferred?.complete(true)
+                val settledFallback = lastAfState == CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED ||
+                    lastAfState == CaptureResult.CONTROL_AF_STATE_PASSIVE_FOCUSED ||
+                    (afSeekPhase == AfSeekPhase.CAF_FALLBACK_SCAN &&
+                        lastAfState == CaptureResult.CONTROL_AF_STATE_INACTIVE &&
+                        !lastLensMoving)
+                if (settledFallback) {
+                    lockCafPositionAndConfirm(_lensFocusDiopters.value, -1L, System.currentTimeMillis() - afTriggerStartMs)
                 } else {
-                    _afLocked.value = false
-                    _isSubjectFocused.value = false
-                    _afLockFailedSeq.value += 1
-                    pendingFocusDeferred?.complete(false)
+                    failAfSeek("AF TIMEOUT mode=${activeSettings.afMode} phase=$afSeekPhase lastAfState=$lastAfState")
                 }
             }
         }
         afLockTimeoutRunnable = r
-        h.postDelayed(r, 2200L)
+        h.postDelayed(r, 5200L)
     }
 
     private fun cancelAfFallbackPulse() {
         afLockTimeoutRunnable?.let { cameraHandler?.removeCallbacks(it) }
         afLockTimeoutRunnable = null
-        afResweepRunnable?.let { cameraHandler?.removeCallbacks(it) }
-        afResweepRunnable = null
-    }
-
-    private fun scheduleAfResweep() {
-        val h = cameraHandler ?: return
-        afResweepRunnable?.let { h.removeCallbacks(it) }
-        val r = Runnable {
-            if (!awaitingAfLock || !userAfActive) return@Runnable
-            val device = cameraDevice ?: return@Runnable
-            val session = captureSession ?: return@Runnable
-            val preview = previewSurface ?: return@Runnable
-            if (!preview.isValid) return@Runnable
-
-            val settings = activeSettings
-            val afRect = buildMeteringRect(settings.customFocusNormX, settings.customFocusNormY, settings.zoomRatio, halfExtentFrac = 0.075f)
-            val aeRect = buildAeMeteringRect(settings)
-            val forceAuto = settings.afMode == AfMode.ONE_SHOT || _capabilities.value?.supportsContinuousPictureAf != true
-
-            scheduleAfFallbackPulse()
-            runCatching {
-                val cancelBuilder = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
-                    addTarget(preview)
-                    set(CaptureRequest.CONTROL_CAPTURE_INTENT, CameraMetadata.CONTROL_CAPTURE_INTENT_PREVIEW)
-                    applyDslrControls(this, settings, afRect = afRect, aeRect = aeRect, isStillCapture = false, forceActiveAfMode = forceAuto)
-                    set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_CANCEL)
-                }
-                session.capture(cancelBuilder.build(), previewCallback, h)
-
-                val triggerBuilder = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
-                    addTarget(preview)
-                    set(CaptureRequest.CONTROL_CAPTURE_INTENT, CameraMetadata.CONTROL_CAPTURE_INTENT_PREVIEW)
-                    applyDslrControls(this, settings, afRect = afRect, aeRect = aeRect, isStillCapture = false, forceActiveAfMode = forceAuto)
-                    set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_START)
-                }
-                session.capture(triggerBuilder.build(), previewCallback, h)
-            }
-        }
-        afResweepRunnable = r
-        h.postDelayed(r, 110L)
     }
 
     private val previewCallback = object : CameraCaptureSession.CaptureCallback() {
@@ -1184,6 +1479,9 @@ class Camera2DslrController(
             result: TotalCaptureResult
         ) {
             val afState = result.get(CaptureResult.CONTROL_AF_STATE)
+            val resAfMode = result.get(CaptureResult.CONTROL_AF_MODE)
+            lastAfState = afState
+            lastObservedHalAfMode = resAfMode
             val lensState = result.get(CaptureResult.LENS_STATE)
             val focusDist = result.get(CaptureResult.LENS_FOCUS_DISTANCE)
             if (focusDist != null) {
@@ -1192,6 +1490,11 @@ class Camera2DslrController(
 
             val lensMoving = lensState == CaptureResult.LENS_STATE_MOVING
             lastLensMoving = lensMoving
+            val curDiopter = focusDist ?: _lensFocusDiopters.value
+            val diopterDelta = if (prevFrameDiopters >= 0f) kotlin.math.abs(curDiopter - prevFrameDiopters) else 0f
+            prevFrameDiopters = curDiopter
+            val opticallySettled = !lensMoving && diopterDelta < 0.045f
+
             val passiveOrActiveMoving = activeSettings.afMode != AfMode.MANUAL && (
                 afState == CaptureResult.CONTROL_AF_STATE_PASSIVE_SCAN ||
                     afState == CaptureResult.CONTROL_AF_STATE_ACTIVE_SCAN ||
@@ -1200,80 +1503,160 @@ class Camera2DslrController(
             // Only emit active AF hunting state/sound during explicit user half-press or focus command
             val activeUserHunting = activeSettings.afMode != AfMode.MANUAL && userAfActive
             val passiveFocusedNow = activeSettings.afMode == AfMode.MANUAL || (
-                (afState == CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED ||
-                    afState == CaptureResult.CONTROL_AF_STATE_PASSIVE_FOCUSED) && !passiveOrActiveMoving
+                !passiveOrActiveMoving && (
+                    afState == CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED ||
+                        afState == CaptureResult.CONTROL_AF_STATE_PASSIVE_FOCUSED ||
+                        (resAfMode == CaptureResult.CONTROL_AF_MODE_CONTINUOUS_PICTURE &&
+                            afState == CaptureResult.CONTROL_AF_STATE_INACTIVE)
+                    )
                 )
 
             _isAfHunting.value = activeUserHunting
             _isPassiveFocused.value = passiveFocusedNow
             if (!awaitingAfLock && _afLocked.value && activeSettings.afMode != AfMode.MANUAL) {
-                if (afState == CaptureResult.CONTROL_AF_STATE_NOT_FOCUSED_LOCKED || lensMoving) {
+                if (activeSettings.afMode == AfMode.AI_FOCUS &&
+                    (afState == CaptureResult.CONTROL_AF_STATE_PASSIVE_SCAN ||
+                        afState == CaptureResult.CONTROL_AF_STATE_PASSIVE_UNFOCUSED ||
+                        lensMoving)
+                ) {
+                    _afLocked.value = false
+                    _isSubjectFocused.value = false
+                } else if (afState == CaptureResult.CONTROL_AF_STATE_NOT_FOCUSED_LOCKED ||
+                    afState == CaptureResult.CONTROL_AF_STATE_PASSIVE_UNFOCUSED ||
+                    lensMoving
+                ) {
                     _isSubjectFocused.value = false
                 }
             }
 
             if (awaitingAfLock) {
-                if (afState == CaptureResult.CONTROL_AF_STATE_ACTIVE_SCAN ||
-                    afState == CaptureResult.CONTROL_AF_STATE_PASSIVE_SCAN ||
-                    lensMoving
-                ) {
-                    sawActiveScan = true
-                }
-                val elapsedMs = System.currentTimeMillis() - afTriggerStartMs
-                if (activeSettings.afMode == AfMode.AI_SERVO) {
-                    if ((sawActiveScan || elapsedMs >= 180L) && !lensMoving &&
-                        (afState == CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED ||
-                            afState == CaptureResult.CONTROL_AF_STATE_PASSIVE_FOCUSED)
-                    ) {
-                        userAfActive = false
-                        awaitingAfLock = false
-                        sawActiveScan = false
-                        cancelAfFallbackPulse()
-                        _isAfHunting.value = false
-                        _afLocked.value = true
-                        _isSubjectFocused.value = true
-                        _afLockConfirmedSeq.value += 1
-                        pendingFocusDeferred?.complete(true)
-                    }
-                } else if (!lensMoving) {
-                    val lockedNow = (afState == CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED &&
-                        (sawActiveScan || elapsedMs >= 200L)) ||
-                        (activeSettings.afMode == AfMode.AI_FOCUS &&
-                            sawActiveScan &&
-                            afState == CaptureResult.CONTROL_AF_STATE_PASSIVE_FOCUSED &&
-                            elapsedMs >= 180L)
-                    val failedNow = sawActiveScan && afState == CaptureResult.CONTROL_AF_STATE_NOT_FOCUSED_LOCKED
-
-                    if (lockedNow) {
-                        userAfActive = false
-                        awaitingAfLock = false
-                        sawActiveScan = false
-                        afRetryCount = 0
-                        cancelAfFallbackPulse()
-                        _isAfHunting.value = false
-                        _afLocked.value = true
-                        _isSubjectFocused.value = true
-                        _afPulseSeq.value += 1
-                        _afLockConfirmedSeq.value += 1
-                        pendingFocusDeferred?.complete(true)
-                    } else if (failedNow) {
-                        _afLockFailedSeq.value += 1
-                        if (userAfActive && afRetryCount < 4) {
-                            afRetryCount++
-                            sawActiveScan = false
-                            afTriggerStartMs = System.currentTimeMillis()
-                            scheduleAfResweep()
-                        } else {
-                            userAfActive = false
-                            awaitingAfLock = false
-                            sawActiveScan = false
-                            cancelAfFallbackPulse()
-                            _isAfHunting.value = false
-                            _afLocked.value = false
-                            _isSubjectFocused.value = false
-                            pendingFocusDeferred?.complete(false)
+                val now = System.currentTimeMillis()
+                val phaseElapsed = now - afPhaseStartMs
+                when (afSeekPhase) {
+                    AfSeekPhase.WAIT_AUTO_READY -> {
+                        val isPostSwitch = result.frameNumber >= afModeSwitchMinFrame || phaseElapsed >= 260L
+                        if (isPostSwitch &&
+                            resAfMode == CameraMetadata.CONTROL_AF_MODE_AUTO &&
+                            (afState == CaptureResult.CONTROL_AF_STATE_INACTIVE || phaseElapsed >= 360L)
+                        ) {
+                            autoReadyFrames++
+                            if (autoReadyFrames >= 2) {
+                                val device = cameraDevice
+                                val preview = previewSurface
+                                if (device != null && preview != null && preview.isValid) {
+                                    val settings = activeSettings
+                                    val afRect = buildMeteringRect(settings.customFocusNormX, settings.customFocusNormY, settings.zoomRatio, halfExtentFrac = 0.10f)
+                                    val aeRect = buildAeMeteringRect(settings)
+                                    afSeekPhase = AfSeekPhase.ACTIVE_AUTO_SCAN
+                                    afPhaseStartMs = now
+                                    afTriggerStartFrame = Long.MAX_VALUE
+                                    sawActiveScan = false
+                                    stableFocusFrames = 0
+                                    autoReadyFrames = 0
+                                    android.util.Log.i(
+                                        "Camera2DslrController",
+                                        "AF AUTO_TRIGGER_START pt=(${"%.2f".format(Locale.US, settings.customFocusNormX)}, ${"%.2f".format(Locale.US, settings.customFocusNormY)})"
+                                    )
+                                    runCatching {
+                                        val triggerStartReq = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
+                                            addTarget(preview)
+                                            set(CaptureRequest.CONTROL_CAPTURE_INTENT, CameraMetadata.CONTROL_CAPTURE_INTENT_PREVIEW)
+                                            applyDslrControls(
+                                                this,
+                                                settings,
+                                                afRect = afRect,
+                                                aeRect = aeRect,
+                                                isStillCapture = false,
+                                                afModeOverride = CameraMetadata.CONTROL_AF_MODE_AUTO
+                                            )
+                                            set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_START)
+                                        }
+                                        session.capture(
+                                            triggerStartReq.build(),
+                                            firstFrameCaptureCallback { fn ->
+                                                if (fn < afTriggerStartFrame) {
+                                                    afTriggerStartFrame = fn
+                                                }
+                                            },
+                                            cameraHandler
+                                        )
+                                    }.onFailure {
+                                        startCafFallbackScan()
+                                    }
+                                } else {
+                                    startCafFallbackScan()
+                                }
+                            }
+                        } else if (phaseElapsed >= 650L) {
+                            startCafFallbackScan()
                         }
                     }
+
+                    AfSeekPhase.ACTIVE_AUTO_SCAN -> {
+                        val postTrigger = result.frameNumber >= afTriggerStartFrame + 2L && phaseElapsed >= 360L
+                        if (postTrigger) {
+                            when {
+                                afState == CaptureResult.CONTROL_AF_STATE_ACTIVE_SCAN ||
+                                    afState == CaptureResult.CONTROL_AF_STATE_PASSIVE_SCAN ||
+                                    lensMoving -> {
+                                    sawActiveScan = true
+                                    stableFocusFrames = 0
+                                }
+                                afState == CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED && opticallySettled -> {
+                                    stableFocusFrames++
+                                    if ((sawActiveScan && stableFocusFrames >= 1) ||
+                                        (!sawActiveScan && stableFocusFrames >= 2 && phaseElapsed >= 1050L)
+                                    ) {
+                                        lockCafPositionAndConfirm(curDiopter, result.frameNumber, now - afTriggerStartMs)
+                                    }
+                                }
+                                afState == CaptureResult.CONTROL_AF_STATE_NOT_FOCUSED_LOCKED -> {
+                                    if (_capabilities.value?.supportsContinuousPictureAf == true && afRetryCount < 1) {
+                                        afRetryCount++
+                                        startCafFallbackScan()
+                                    } else {
+                                        failAfSeek("AF FAILED mode=${activeSettings.afMode} state=NOT_FOCUSED_LOCKED")
+                                    }
+                                }
+                                !sawActiveScan && afState == CaptureResult.CONTROL_AF_STATE_INACTIVE && phaseElapsed >= 900L -> {
+                                    startCafFallbackScan()
+                                }
+                                else -> stableFocusFrames = 0
+                            }
+                        }
+                    }
+
+                    AfSeekPhase.CAF_FALLBACK_SCAN -> {
+                        val postCaf = result.frameNumber >= afTriggerStartFrame || phaseElapsed >= 240L
+                        if (postCaf) {
+                            when {
+                                afState == CaptureResult.CONTROL_AF_STATE_PASSIVE_SCAN ||
+                                    afState == CaptureResult.CONTROL_AF_STATE_ACTIVE_SCAN ||
+                                    lensMoving -> {
+                                    sawActiveScan = true
+                                    stableFocusFrames = 0
+                                }
+                                opticallySettled && (
+                                    afState == CaptureResult.CONTROL_AF_STATE_PASSIVE_FOCUSED ||
+                                        afState == CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED ||
+                                        (afState == CaptureResult.CONTROL_AF_STATE_INACTIVE && (sawActiveScan || phaseElapsed >= 420L))
+                                    ) -> {
+                                    stableFocusFrames++
+                                    if ((sawActiveScan && stableFocusFrames >= 2) ||
+                                        (!sawActiveScan && stableFocusFrames >= 3 && phaseElapsed >= 420L)
+                                    ) {
+                                        lockCafPositionAndConfirm(curDiopter, result.frameNumber, now - afTriggerStartMs)
+                                    }
+                                }
+                                sawActiveScan && afState == CaptureResult.CONTROL_AF_STATE_PASSIVE_UNFOCUSED && phaseElapsed >= 900L -> {
+                                    failAfSeek("AF FAILED mode=${activeSettings.afMode} state=PASSIVE_UNFOCUSED")
+                                }
+                                else -> stableFocusFrames = 0
+                            }
+                        }
+                    }
+
+                    AfSeekPhase.IDLE -> Unit
                 }
             }
 
@@ -1376,6 +1759,7 @@ class Camera2DslrController(
                 finalizePendingBufferItem(meta.captureId, savedUri.toString(), finalPreview)
                 finalized = true
                 val elapsedMs = System.currentTimeMillis() - t0
+                android.util.Log.i("Camera2DslrController", "Saved $fileName in ${elapsedMs}ms (bokeh=${settings.opticalBokehStrength})")
                 _lastSavedEvent.value = "Saved $fileName (${elapsedMs}ms)"
             }
         } finally {

@@ -24,8 +24,10 @@ data class CameraSettingsState(
     val isCameraPoweredOn: Boolean = true,
     val exposureMode: ExposureMode = ExposureMode.APERTURE_PRIORITY,
     val shutterSpeedNs: Long = 4_000_000L, // 1/250s
-    val simulatedApertureF: Float = 2.0f, // Wide prime aperture for natural creamy lens bokeh
+    val simulatedApertureF: Float = 2.8f, // Balanced prime aperture baseline for realistic bokeh
     val opticalBokehEnabled: Boolean = true,
+    val bokehUserMultiplier: Float = 1.0f, // 0.0..1.6 user blur intensity slider
+    val isBokehSliderOpen: Boolean = false,
     val iso: Int = 0, // 0 = AUTO
     val evCompensation: Float = 0f,
     val zoomRatio: Float = 1.0f,
@@ -56,7 +58,7 @@ data class CameraSettingsState(
     val saturationOffset: Int = 0,   // -4..+4
     val colorToneOffset: Int = 0,    // -4..+4
     val lutIntensity: Float = 0.48f,
-    val highlightRolloff: Float = 0.14f,
+    val highlightRolloff: Float = 0.08f,
     val saveRawDng: Boolean = false,
     val topLcdAmberBacklight: Boolean = false,
     val infoDisplayMode: InfoDisplayMode = InfoDisplayMode.LIVE_VIEW_OVERLAYS,
@@ -89,17 +91,18 @@ data class CameraSettingsState(
      */
     val opticalBokehStrength: Float
         get() {
-            if (!opticalBokehEnabled || simulatedApertureF >= 8.0f) return 0f
+            if (!opticalBokehEnabled || bokehUserMultiplier <= 0.02f || simulatedApertureF >= 11.0f) return 0f
             val base = when {
-                simulatedApertureF <= 1.25f -> 0.80f
-                simulatedApertureF <= 1.5f -> 0.68f
-                simulatedApertureF <= 2.1f -> 0.52f
-                simulatedApertureF <= 2.9f -> 0.36f
-                simulatedApertureF <= 4.1f -> 0.20f
-                simulatedApertureF <= 5.7f -> 0.09f
+                simulatedApertureF <= 1.25f -> 0.82f
+                simulatedApertureF <= 1.5f -> 0.70f
+                simulatedApertureF <= 2.1f -> 0.54f
+                simulatedApertureF <= 2.9f -> 0.40f
+                simulatedApertureF <= 4.1f -> 0.26f
+                simulatedApertureF <= 5.7f -> 0.15f
+                simulatedApertureF <= 8.1f -> 0.08f
                 else -> 0f
             }
-            return (base * externalLens.bokehAssistScale).coerceIn(0f, 0.85f)
+            return (base * externalLens.bokehAssistScale * bokehUserMultiplier).coerceIn(0f, 1.0f)
         }
 
     /**
@@ -107,9 +110,9 @@ data class CameraSettingsState(
      */
     val simulatedVignetteStrength: Float
         get() = when {
-            simulatedApertureF <= 1.4f -> 0.06f
-            simulatedApertureF <= 2.0f -> 0.04f
-            simulatedApertureF <= 2.8f -> 0.02f
+            simulatedApertureF <= 1.4f -> 0.03f
+            simulatedApertureF <= 2.0f -> 0.02f
+            simulatedApertureF <= 2.8f -> 0.01f
             else -> 0.0f
         }
 

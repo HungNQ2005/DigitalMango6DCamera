@@ -7,6 +7,7 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.calculateZoom
@@ -179,6 +180,10 @@ fun RecessedViewfinderMonitor(
                 } else {
                     var viewSize by remember { mutableStateOf(IntSize(1, 1)) }
                     val focusPeaking = state.afMode == AfMode.MANUAL
+                    val liveBokehActive = (state.isSubjectFocused && state.isHalfPressedAfLocked) ||
+                        state.afMode == AfMode.MANUAL ||
+                        (isPassiveFocused && !state.isAfHunting) ||
+                        state.isBokehSliderOpen
 
                     AndroidView(
                         modifier = Modifier
@@ -237,7 +242,7 @@ fun RecessedViewfinderMonitor(
                                     bokehStrength = state.opticalBokehStrength,
                                     focusCenterX = state.customFocusNormX,
                                     focusCenterY = state.customFocusNormY,
-                                    isSubjectFocused = (state.isSubjectFocused && state.isHalfPressedAfLocked) || state.afMode == AfMode.MANUAL,
+                                    isSubjectFocused = liveBokehActive,
                                     isAutoAfSelection = state.isAutoAfSelection,
                                     lensFocusDiopters = state.lensFocusDiopters,
                                     contrastOffset = state.contrastOffset,
@@ -263,7 +268,7 @@ fun RecessedViewfinderMonitor(
                                 bokehStrength = state.opticalBokehStrength,
                                 focusCenterX = state.customFocusNormX,
                                 focusCenterY = state.customFocusNormY,
-                                isSubjectFocused = (state.isSubjectFocused && state.isHalfPressedAfLocked) || state.afMode == AfMode.MANUAL,
+                                isSubjectFocused = liveBokehActive,
                                 isAutoAfSelection = state.isAutoAfSelection,
                                 lensFocusDiopters = state.lensFocusDiopters,
                                 contrastOffset = state.contrastOffset,
@@ -338,10 +343,16 @@ fun RecessedViewfinderMonitor(
                                     text = "[${state.pictureStyle.shortCode}] ${state.pictureStyle.title}",
                                     accent = DslrColors.MangoGold
                                 )
-                                if (state.opticalBokehEnabled && state.opticalBokehStrength > 0.05f) {
+                                Box(
+                                    modifier = Modifier.clickable {
+                                        onUpdateState { it.copy(isBokehSliderOpen = !it.isBokehSliderOpen) }
+                                    }
+                                ) {
+                                    val bokehPct = kotlin.math.round(state.bokehUserMultiplier * 100f).toInt()
+                                    val activeBokeh = state.opticalBokehEnabled && state.bokehUserMultiplier > 0.02f
                                     BadgePill(
-                                        text = "${DslrStops.formatAperture(state.simulatedApertureF)} BOKEH",
-                                        accent = DslrColors.VfEmeraldText
+                                        text = if (activeBokeh) "${DslrStops.formatAperture(state.simulatedApertureF)} · $bokehPct%" else "BOKEH OFF",
+                                        accent = if (activeBokeh) DslrColors.VfEmeraldText else DslrColors.LegendMuted
                                     )
                                 }
                                 if (state.aebEnabled) {
@@ -351,6 +362,17 @@ fun RecessedViewfinderMonitor(
                                     BadgePill(text = "MF PEAKING", accent = DslrColors.VfRedAf)
                                 }
                             }
+                        }
+
+                        if (!anyOverlayOpen && state.isBokehSliderOpen) {
+                            LiveBokehControlBar(
+                                state = state,
+                                onUpdateState = onUpdateState,
+                                onClose = { onUpdateState { it.copy(isBokehSliderOpen = false) } },
+                                modifier = Modifier
+                                    .align(Alignment.BottomCenter)
+                                    .padding(start = 12.dp, end = 12.dp, bottom = 30.dp)
+                            )
                         }
 
                         if (!anyOverlayOpen) {

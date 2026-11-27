@@ -952,6 +952,21 @@ class CameraLutGlRenderer(
                 return texture(uLutTex, coord).rgb;
             }
 
+            vec3 applyCanonAloClarity(vec3 col) {
+                float lum = luminance(col);
+                float shadowToe = smoothstep(0.0, 0.032, lum);
+                float aloMask = shadowToe * (1.0 - smoothstep(0.50, 0.92, lum));
+                vec3 lifted = pow(max(col, vec3(0.0)), vec3(0.84));
+                vec3 c = mix(col, lifted, 0.44 * aloMask);
+                c = clamp((c - 0.42) * 1.065 + 0.435, 0.0, 1.0);
+                c.r = clamp(c.r * 1.014, 0.0, 1.0);
+                c.b = clamp(c.b * 1.006, 0.0, 1.0);
+                float l2 = luminance(c);
+                float sat = max(c.r, max(c.g, c.b)) - min(c.r, min(c.g, c.b));
+                float vib = (1.0 - smoothstep(0.32, 0.82, sat)) * 0.16;
+                return clamp(mix(vec3(l2), c, 1.0 + vib), 0.0, 1.0);
+            }
+
             void main() {
                 vec3 centerRaw = texture(uCameraTex, clamp(vTexCoord, 0.002, 0.998)).rgb;
                 vec3 raw;
@@ -965,9 +980,7 @@ class CameraLutGlRenderer(
                 }
 
                 vec3 rolled = applyHighlightRolloff(raw, uHighlightRolloff);
-                vec3 graded = mix(rolled, sampleLut(rolled), uLutIntensity);
-                graded = clamp((graded - 0.012) / 0.988, 0.0, 1.0);
-                graded = mix(graded, graded * graded * (3.0 - 2.0 * graded), 0.14);
+                vec3 graded = applyCanonAloClarity(mix(rolled, sampleLut(rolled), uLutIntensity));
 
                 if (abs(uContrast) > 0.05) {
                     float cFactor = 1.0 + uContrast * 0.08;

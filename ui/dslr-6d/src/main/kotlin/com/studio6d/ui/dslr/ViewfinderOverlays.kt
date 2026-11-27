@@ -470,6 +470,22 @@ fun CameraMenuOverlay(
                         checked = state.opticalBokehEnabled,
                         onToggle = { onUpdateState { it.copy(opticalBokehEnabled = !it.opticalBokehEnabled) } }
                     )
+                    Text(
+                        text = "Bokeh Blur Strength: ${(state.bokehUserMultiplier * 100).toInt()}% (${DslrStops.formatAperture(state.simulatedApertureF)})",
+                        fontSize = 9.sp,
+                        fontFamily = FontFamily.Monospace,
+                        color = DslrColors.VfEmeraldText,
+                        maxLines = 1,
+                        softWrap = false,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    DslrMenuSlider(
+                        value = state.bokehUserMultiplier.coerceIn(0f, 1.6f),
+                        valueRange = 0f..1.6f,
+                        onValueChange = { v ->
+                            onUpdateState { it.copy(bokehUserMultiplier = v, opticalBokehEnabled = v > 0.02f) }
+                        }
+                    )
                     MenuCycleRow(
                         label = "External Lens Attachment",
                         value = state.externalLens.label,
@@ -1033,5 +1049,82 @@ fun InBodyPlaybackOverlay(
                 }
             }
         }
+    }
+}
+
+/**
+ * Floating Live View Bokeh Intensity Slider Bar (coupled with Av aperture stop).
+ * Lets photographers dial subtle-to-creamy background blur (0%..160%) live while framing.
+ */
+@Composable
+fun LiveBokehControlBar(
+    state: CameraSettingsState,
+    onUpdateState: ((CameraSettingsState) -> CameraSettingsState) -> Unit,
+    onClose: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val active = state.opticalBokehEnabled && state.bokehUserMultiplier > 0.02f
+    val pct = (state.bokehUserMultiplier * 100f).toInt()
+
+    Row(
+        modifier = modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(8.dp))
+            .background(Color(0xDD0D1016))
+            .border(1.dp, if (active) DslrColors.VfEmeraldText.copy(alpha = 0.65f) else DslrColors.ChassisHairline, RoundedCornerShape(8.dp))
+            .padding(horizontal = 8.dp, vertical = 5.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(7.dp)
+    ) {
+        Text(
+            text = if (active) "ON" else "OFF",
+            fontFamily = FontFamily.Monospace,
+            fontWeight = FontWeight.Bold,
+            fontSize = 9.sp,
+            color = if (active) Color.Black else DslrColors.LegendMuted,
+            modifier = Modifier
+                .clip(RoundedCornerShape(4.dp))
+                .background(if (active) DslrColors.VfEmeraldText else Color(0xFF1F242D))
+                .clickable {
+                    onUpdateState { s ->
+                        val nextOn = !s.opticalBokehEnabled
+                        s.copy(
+                            opticalBokehEnabled = nextOn,
+                            bokehUserMultiplier = if (nextOn && s.bokehUserMultiplier <= 0.05f) 1.0f else s.bokehUserMultiplier
+                        )
+                    }
+                }
+                .padding(horizontal = 6.dp, vertical = 2.dp)
+        )
+        Text(
+            text = "BLUR $pct%",
+            fontFamily = FontFamily.Monospace,
+            fontWeight = FontWeight.Bold,
+            fontSize = 9.sp,
+            color = if (active) DslrColors.MangoGold else DslrColors.LegendMuted,
+            maxLines = 1,
+            softWrap = false
+        )
+        Box(modifier = Modifier.weight(1f)) {
+            DslrMenuSlider(
+                value = state.bokehUserMultiplier.coerceIn(0f, 1.6f),
+                valueRange = 0f..1.6f,
+                onValueChange = { v ->
+                    onUpdateState { it.copy(bokehUserMultiplier = v, opticalBokehEnabled = v > 0.02f) }
+                }
+            )
+        }
+        Text(
+            text = "✕",
+            fontFamily = FontFamily.Monospace,
+            fontWeight = FontWeight.Bold,
+            fontSize = 10.sp,
+            color = DslrColors.LegendWhite,
+            modifier = Modifier
+                .clip(RoundedCornerShape(4.dp))
+                .background(Color(0xFF232934))
+                .clickable(onClick = onClose)
+                .padding(horizontal = 6.dp, vertical = 2.dp)
+        )
     }
 }

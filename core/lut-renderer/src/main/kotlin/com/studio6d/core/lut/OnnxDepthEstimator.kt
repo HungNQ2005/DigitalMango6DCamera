@@ -64,11 +64,14 @@ class OnnxDepthEstimator private constructor(private val appContext: Context) {
                 val t0 = System.currentTimeMillis()
                 val modelFile = ensureModelFileOnDisk()
                 val ortEnv = OrtEnvironment.getEnvironment()
-                val opts = OrtSession.SessionOptions().apply {
-                    setIntraOpNumThreads(4)
-                    setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
+                val ortSession = OrtSession.SessionOptions().use { opts ->
+                    opts.setIntraOpNumThreads(4)
+                    opts.setExecutionMode(OrtSession.SessionOptions.ExecutionMode.SEQUENTIAL)
+                    opts.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
+                    opts.setMemoryPatternOptimization(false)
+                    opts.setCPUArenaAllocator(false)
+                    ortEnv.createSession(modelFile.absolutePath, opts)
                 }
-                val ortSession = ortEnv.createSession(modelFile.absolutePath, opts)
                 val firstInput = ortSession.inputNames.firstOrNull() ?: "pixel_values"
                 val tensorInfo = ortSession.inputInfo[firstInput]?.info as? TensorInfo
                 val shape = tensorInfo?.shape
@@ -220,7 +223,7 @@ class OnnxDepthEstimator private constructor(private val appContext: Context) {
         private const val TAG = "OnnxDepthEstimator"
         private const val ASSET_MODEL_PATH = "models/depth_anything_v2_small_q8.onnx"
         private const val CACHE_FILE_NAME = "depth_anything_v2_small_q8.onnx"
-        // Multiples of 14 (ViT patch size) matching 3:2 DSLR aspect ratio
+        // Multiples of 14 (ViT patch size: 24x16 patches) matching 3:2 DSLR aspect ratio
         private const val DEFAULT_INPUT_W = 336
         private const val DEFAULT_INPUT_H = 224
 
